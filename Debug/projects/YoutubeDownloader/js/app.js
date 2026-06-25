@@ -86,6 +86,11 @@ const Nav = {
 
   // Move focus to a specific zone + index
   set(zone, idx = 0) {
+    // Blur any natively focused input so the TV keyboard doesn't pop up
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') {
+      document.activeElement.blur();
+    }
+
     // Remove previous focus
     document.querySelectorAll('.focused').forEach(el => el.classList.remove('focused'));
 

@@ -245,6 +245,7 @@ function showSection(name) {
   if      (name === 'home')      loadHome();
   else if (name === 'library')   loadLibrary();
   else if (name === 'downloads') loadJobs();
+  else if (name === 'logs')      loadLogs();
   else if (name === 'search') {
     Nav.set('searchbar', 0);
     $('search-input').focus();
@@ -570,6 +571,39 @@ async function downloadSelected() {
     showToast('Download failed: ' + err.message.slice(0, 60));
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOGS
+// ─────────────────────────────────────────────────────────────────────────────
+function escapeHTML(str) {
+  if (!str) return '';
+  return str.replace(/[&<>'"]/g, 
+    tag => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[tag])
+  );
+}
+
+async function loadLogs() {
+  const c = $('logs-list');
+  c.innerHTML = '<div class="spinner"></div>';
+  try {
+    const logs = await apiFetch('/api/logs');
+    if (!logs.length) {
+      c.innerHTML = '<div class="empty-state">No logs available.</div>';
+      Nav.set('sidebar', Nav.sidebarIdx());
+      return;
+    }
+    c.innerHTML = logs.map(l => `<div class="log-line">${escapeHTML(l)}</div>`).join('');
+    // Auto scroll to bottom
+    c.scrollTop = c.scrollHeight;
+    Nav.set('sidebar', Nav.sidebarIdx());
+  } catch (err) {
+    c.innerHTML = `<div class="error-msg">${escapeHTML(err.message)}</div>`;
+    Nav.set('sidebar', Nav.sidebarIdx());
+  }
+}
+
+$('btn-refresh-logs').onclick = loadLogs;
+$('btn-clear-logs').onclick = () => { $('logs-list').innerHTML = ''; };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PLAYER

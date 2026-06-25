@@ -7,6 +7,18 @@ const fs        = require('fs');
 const { spawn } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
 
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory log ring buffer — last 200 lines, readable from /api/logs
+// ─────────────────────────────────────────────────────────────────────────────
+const LOG_RING = [];
+const LOG_MAX  = 200;
+function log(tag, msg) {
+  const entry = `[${new Date().toISOString()}] [${tag}] ${msg}`;
+  console.log(entry);
+  LOG_RING.push(entry);
+  if (LOG_RING.length > LOG_MAX) LOG_RING.shift();
+}
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
@@ -50,7 +62,8 @@ function cookieArgs() {
  */
 function checkAuth() {
   return new Promise((resolve) => {
-    const proc = spawn('yt-dlp', [
+    const proc = spawn('python3', [
+      '-m', 'yt_dlp',
       '--cookies-from-browser', BROWSER,
       '--simulate', '--quiet', '--no-warnings',
       'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
@@ -191,6 +204,7 @@ app.get('/api/jobs/:id', (req,  res) => {
 
 function startDownload(job) {
   job.status = 'downloading';
+  job.logs   = [];
 
   const args = [
     ...cookieArgs(),
@@ -202,7 +216,10 @@ function startDownload(job) {
     `https://www.youtube.com/watch?v=${job.videoId}`,
   ];
 
-  const proc = spawn('yt-dlp', args);
+  log('download', `Starting: ${job.videoId} "${job.title}"`);
+  log('download', `Command: python3 -m yt_dlp ${args.join(' ')}`);
+
+  const proc = spawn('python3', ['-m', 'yt_dlp', ...args]);
   let buf = '';
 
   const onData = (d) => {
@@ -211,7 +228,10 @@ function startDownload(job) {
     buf = lines.pop();
 
     for (const line of lines) {
-      console.log('[yt-dlp]', line);
+      if (!line.trim()) continue;
+      log('yt-dlp', line);
+      job.logs.push(line);
+      if (job.logs.length > 100) job.logs.shift();
 
       const pm = line.match(/\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\w+\/s).*?ETA\s+([\d:]+)/i);
       if (pm) { job.progress = parseFloat(pm[1]); job.speed = pm[2]; job.eta = pm[3]; }
@@ -220,6 +240,10 @@ function startDownload(job) {
       if (dm) job.filePath = dm[1].trim();
 
       if (/Merging formats/i.test(line)) { job.status = 'processing'; job.progress = 99; }
+
+      // Capture meaningful error lines for the job.error field
+      const errMatch = line.match(/ERROR:\s+(.+)/i);
+      if (errMatch) job._lastError = errMatch[1].trim();
     }
   };
 
@@ -229,6 +253,7 @@ function startDownload(job) {
   proc.on('close', (code) => {
     if (code === 0) {
       job.status = 'done'; job.progress = 100; job.speed = ''; job.eta = '';
+      log('download', `Done: ${job.videoId}`);
       if (job.filePath && fs.existsSync(job.filePath)) {
         const metaPath = job.filePath.replace(/\.mp4$/i, '.json');
         try {
@@ -241,12 +266,23 @@ function startDownload(job) {
       }
     } else {
       job.status = 'error';
-      job.error  = `yt-dlp exited with code ${code}`;
+      // Use the actual ERROR: line captured from yt-dlp output if available
+      job.error = job._lastError || `yt-dlp exited with code ${code}`;
+      log('download', `FAILED: ${job.videoId} — ${job.error}`);
     }
   });
 
-  proc.on('error', (err) => { job.status = 'error'; job.error = err.message; });
+  proc.on('error', (err) => {
+    job.status = 'error';
+    job.error  = err.message;
+    log('download', `SPAWN ERROR: ${err.message}`);
+  });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Logs endpoint — returns last N server log lines
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/logs', (_req, res) => res.json(LOG_RING));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Library
@@ -312,7 +348,7 @@ app.get('/api/stream/:filename', (req, res) => {
 
 function ytdlpJson(args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('yt-dlp', ['--dump-json', ...args]);
+    const proc = spawn('python3', ['-m', 'yt_dlp', '--dump-json', ...args]);
     let out = '', err = '';
     proc.stdout.on('data', d => { out += d; });
     proc.stderr.on('data', d => { err += d; });

@@ -67,9 +67,12 @@
       <div class="nav-item" id="nav-downloads" data-focuszone="sidebar" data-focusidx="3" data-target="downloads">
         <span class="nav-icon">⬇</span><span>Downloads</span>
       </div>
+      <div class="nav-item" id="nav-logs"      data-focuszone="sidebar" data-focusidx="4" data-target="logs">
+        <span class="nav-icon">⌨</span><span>Logs</span>
+      </div>
     </div>
 
-    <div class="nav-item nav-signout" data-focuszone="sidebar" data-focusidx="4" data-action="signout">
+    <div class="nav-item nav-signout" data-focuszone="sidebar" data-focusidx="5" data-action="signout">
       <span class="nav-icon">⎋</span><span>Sign Out</span>
     </div>
   </nav>
@@ -117,6 +120,16 @@
         <button class="btn-icon" id="btn-refresh-jobs" data-focuszone="downloads-header" data-focusidx="0">↻ Refresh</button>
       </div>
       <div id="jobs-list" class="jobs-list"></div>
+    </section>
+
+    <!-- Logs Section -->
+    <section id="section-logs" class="content-section hidden">
+      <div class="section-header">
+        <h2>Server Logs</h2>
+        <button class="btn-icon" id="btn-refresh-logs" data-focuszone="logs-header" data-focusidx="0">↻ Refresh</button>
+        <button class="btn-icon" id="btn-clear-logs"   data-focuszone="logs-header" data-focusidx="1">✕ Clear</button>
+      </div>
+      <div id="logs-list" class="logs-list"></div>
     </section>
 
   </main>

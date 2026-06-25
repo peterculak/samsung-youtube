@@ -373,3 +373,30 @@ html, body {
 .toast.hidden { display: none; }
 
 .hidden { display: none !important; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LOGS SECTION
+   ═══════════════════════════════════════════════════════════════════════════ */
+.logs-list {
+  background: var(--bg-1);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius);
+  padding: 24px;
+  height: 500px;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+.log-line {
+  border-bottom: 1px solid var(--bg-3);
+  padding: 6px 0;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.log-line:last-child {
+  border-bottom: none;
+}

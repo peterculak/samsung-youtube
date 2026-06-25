@@ -194,6 +194,7 @@ function startDownload(job) {
 
   const args = [
     ...cookieArgs(),
+    '--extractor-args', 'youtube:player_client=default,ios',
     '-f', 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
     '--merge-output-format', 'mp4',
     '--no-warnings', '--newline',
