@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="description" content="YouTube Downloader for Samsung TV — browse, download and watch YouTube videos.">
+  <title>YouTube TV Downloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ═══════════════════════════ LOGIN SCREEN ════════════════════════════════ -->
+<div id="screen-login" class="screen active">
+  <div class="login-bg-glow"></div>
+  <div class="login-wrap">
+
+    <div class="login-logo">
+      <div class="logo-badge">▶</div>
+      <span class="logo-wordmark">YouTube<span class="logo-tv"> TV</span></span>
+    </div>
+
+    <h1>Connect to YouTube</h1>
+    <p class="login-subtitle">Log into YouTube in Chrome on this Mac,<br>then click Verify below</p>
+
+    <div id="auth-checking-box" class="auth-code-box">
+      <div class="auth-waiting">
+        <div class="spinner"></div>
+        <span id="auth-status-msg">Checking Chrome cookies…</span>
+      </div>
+    </div>
+
+    <div class="auth-actions">
+      <button id="btn-verify" class="btn btn-primary" data-focuszone="login" data-focusidx="0">
+        ✓ Verify Connection
+      </button>
+    </div>
+
+    <div id="auth-error" class="auth-error hidden">
+      <span id="auth-error-msg">Not logged in.</span>&nbsp;
+      <button id="btn-retry" class="btn btn-outline" data-focuszone="login" data-focusidx="1">
+        Try Again
+      </button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════════════════ MAIN SCREEN ═════════════════════════════════ -->
+<div id="screen-main" class="screen">
+
+  <!-- Sidebar Navigation -->
+  <nav id="sidebar" class="sidebar">
+    <div class="sidebar-logo">▶ YTD</div>
+
+    <div class="nav-items">
+      <div class="nav-item" id="nav-home"      data-focuszone="sidebar" data-focusidx="0" data-target="home">
+        <span class="nav-icon">⊞</span><span>Home</span>
+      </div>
+      <div class="nav-item" id="nav-search"    data-focuszone="sidebar" data-focusidx="1" data-target="search">
+        <span class="nav-icon">⌕</span><span>Search</span>
+      </div>
+      <div class="nav-item" id="nav-library"   data-focuszone="sidebar" data-focusidx="2" data-target="library">
+        <span class="nav-icon">▤</span><span>Library</span>
+      </div>
+      <div class="nav-item" id="nav-downloads" data-focuszone="sidebar" data-focusidx="3" data-target="downloads">
+        <span class="nav-icon">⬇</span><span>Downloads</span>
+      </div>
+    </div>
+
+    <div class="nav-item nav-signout" data-focuszone="sidebar" data-focusidx="4" data-action="signout">
+      <span class="nav-icon">⎋</span><span>Sign Out</span>
+    </div>
+  </nav>
+
+  <!-- Content Area -->
+  <main id="main-content">
+
+    <!-- Home Section -->
+    <section id="section-home" class="content-section">
+      <div class="section-header">
+        <h2 id="home-title">Home</h2>
+        <button class="btn-icon" id="btn-refresh-home" data-focuszone="home-header" data-focusidx="0">↻ Refresh</button>
+      </div>
+      <div id="grid-home" class="video-grid"></div>
+    </section>
+
+    <!-- Search Section -->
+    <section id="section-search" class="content-section hidden">
+      <div class="search-bar-wrap">
+        <div class="search-bar" id="search-bar-container">
+          <span class="search-icon">⌕</span>
+          <input type="text" id="search-input" class="search-input"
+            placeholder="Search YouTube…"
+            data-focuszone="searchbar" data-focusidx="0" autocomplete="off">
+          <button id="btn-search" class="btn btn-primary search-btn"
+            data-focuszone="searchbar" data-focusidx="1">Search</button>
+        </div>
+      </div>
+      <div id="grid-search" class="video-grid"></div>
+    </section>
+
+    <!-- Library Section -->
+    <section id="section-library" class="content-section hidden">
+      <div class="section-header">
+        <h2>Downloaded Videos</h2>
+        <button class="btn-icon" id="btn-refresh-library" data-focuszone="library-header" data-focusidx="0">↻ Refresh</button>
+      </div>
+      <div id="grid-library" class="video-grid"></div>
+    </section>
+
+    <!-- Downloads Section -->
+    <section id="section-downloads" class="content-section hidden">
+      <div class="section-header">
+        <h2>Download Queue</h2>
+        <button class="btn-icon" id="btn-refresh-jobs" data-focuszone="downloads-header" data-focusidx="0">↻ Refresh</button>
+      </div>
+      <div id="jobs-list" class="jobs-list"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ═══════════════════════════ VIDEO MODAL ══════════════════════════════════ -->
+<div id="modal-video" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-backdrop" id="modal-backdrop"></div>
+  <div class="modal-box">
+    <img id="modal-thumb" class="modal-thumb" src="" alt="Video thumbnail">
+    <div class="modal-info">
+      <h3 id="modal-title" class="modal-title"></h3>
+      <p  id="modal-channel"  class="modal-channel"></p>
+      <p  id="modal-duration" class="modal-meta"></p>
+    </div>
+    <div class="modal-actions">
+      <button id="modal-btn-download" class="btn btn-primary"   data-focuszone="modal" data-focusidx="0">⬇ Download</button>
+      <button id="modal-btn-play"     class="btn btn-success hidden" data-focuszone="modal" data-focusidx="1">▶ Play</button>
+      <button id="modal-btn-close"    class="btn btn-outline"   data-focuszone="modal" data-focusidx="2">✕ Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════ PLAYER SCREEN ════════════════════════════════ -->
+<div id="screen-player" class="screen">
+  <div class="player-container">
+    <video id="video-player" preload="auto" playsinline></video>
+    <div class="player-ui" id="player-ui">
+      <div class="player-top">
+        <button id="btn-player-back" class="player-btn" data-focuszone="player" data-focusidx="0">← Back</button>
+        <span   id="player-title-text" class="player-title"></span>
+      </div>
+      <div class="player-bottom">
+        <button id="btn-play-pause" class="player-btn player-play-btn" data-focuszone="player" data-focusidx="1">⏸</button>
+        <div class="player-progress-wrap">
+          <span id="player-time-current" class="player-time">0:00</span>
+          <div  class="player-progress-track" id="player-progress-track">
+            <div class="player-progress-fill" id="player-progress-fill"></div>
+            <div class="player-progress-thumb" id="player-progress-thumb"></div>
+          </div>
+          <span id="player-time-total" class="player-time">0:00</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════ TOAST ════════════════════════════════════════ -->
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+<script src="js/config.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
