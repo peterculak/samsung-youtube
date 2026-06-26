@@ -155,6 +155,11 @@ html, body {
 }
 .btn-success { background: var(--success); color: #000; }
 .btn-success:hover, .btn-success.focused { background: #00c060; }
+.btn-stream { background: linear-gradient(135deg, #00b4d8, #0077b6); color: #fff; }
+.btn-stream:hover, .btn-stream.focused {
+  background: linear-gradient(135deg, #00d4f8, #0099d6);
+  box-shadow: 0 0 24px rgba(0, 180, 216, 0.5);
+}
 .btn-outline { background: transparent; color: var(--text); border: 2px solid var(--bg-4); }
 .btn-outline:hover, .btn-outline.focused { border-color: var(--text-2); background: var(--bg-3); }
 

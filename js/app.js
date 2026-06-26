@@ -43,6 +43,11 @@ const api = {
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
+  async delete(path) {
+    const r = await fetch(`${SERVER}${path}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  },
 };
 
 // ─── App State ───────────────────────────────────────────────────────────────
@@ -377,7 +382,15 @@ function renderLibraryGrid(grid) {
       thumbnail: f.thumbnail,
       badge:     '<div class="card-badge badge-downloaded">▶ Play</div>',
     });
-    card.addEventListener('click', () => playFile(f));
+    card.addEventListener('click', () => {
+      const v = {
+        id: f.videoId,
+        title: f.title,
+        channel: f.channel,
+        thumbnail: f.thumbnail
+      };
+      openModal(v, true, false);
+    });
     grid.appendChild(card);
   });
   lazyLoadImages(grid);
@@ -402,7 +415,13 @@ function renderJobs() {
     return;
   }
 
-  list.innerHTML = State.jobs.map(job => {
+  // Remove empty state if present
+  if (list.querySelector('.empty-state')) {
+    list.innerHTML = '';
+  }
+
+  State.jobs.forEach(job => {
+    let item = $(`job-item-${job.id}`);
     const pct = job.progress || 0;
     const fillCls = job.status === 'done' ? 'success' : job.status === 'error' ? 'error' : '';
     const statusColor = {
@@ -414,8 +433,33 @@ function renderJobs() {
       ? `<img class="job-thumb" src="${esc(job.thumbnail)}" loading="lazy" alt="">`
       : `<div class="job-thumb-icon">▶</div>`;
 
-    return `
-      <div class="job-item">
+    const statusText = job.status === 'downloading' ? `${Math.round(pct)}%` : capitalize(job.status);
+    const metaHtml = `
+      ${job.speed ? `<span>${esc(job.speed)}</span>` : ''}
+      ${job.eta   ? `<span>ETA ${esc(job.eta)}</span>` : ''}
+    `;
+
+    if (item) {
+      // Update existing
+      const fill = item.querySelector('.job-progress-fill');
+      if (fill) {
+        fill.className = `job-progress-fill ${fillCls}`;
+        fill.style.width = `${pct}%`;
+      }
+      const meta = item.querySelector('.job-meta');
+      if (meta) meta.innerHTML = metaHtml;
+      
+      const status = item.querySelector('.job-status');
+      if (status) {
+        status.style.color = statusColor;
+        status.textContent = statusText;
+      }
+    } else {
+      // Create new
+      item = document.createElement('div');
+      item.className = 'job-item';
+      item.id = `job-item-${job.id}`;
+      item.innerHTML = `
         ${thumbEl}
         <div class="job-info">
           <div class="job-title">${esc(job.title)}</div>
@@ -423,15 +467,23 @@ function renderJobs() {
             <div class="job-progress-fill ${fillCls}" style="width:${pct}%"></div>
           </div>
           <div class="job-meta">
-            ${job.speed ? `<span>${esc(job.speed)}</span>` : ''}
-            ${job.eta   ? `<span>ETA ${esc(job.eta)}</span>` : ''}
+            ${metaHtml}
           </div>
         </div>
         <div class="job-status" style="color:${statusColor}">
-          ${job.status === 'downloading' ? `${Math.round(pct)}%` : capitalize(job.status)}
-        </div>
-      </div>`;
-  }).join('');
+          ${statusText}
+        </div>`;
+      list.appendChild(item);
+    }
+  });
+
+  // Remove stale items
+  const currentIds = State.jobs.map(j => `job-item-${j.id}`);
+  Array.from(list.children).forEach(child => {
+    if (child.id && child.id.startsWith('job-item-') && !currentIds.includes(child.id)) {
+      child.remove();
+    }
+  });
 }
 
 function startJobPolling() {
@@ -520,31 +572,40 @@ function lazyLoadImages(container) {
 function openModal(video, isDownloaded, isDownloading) {
   State.selectedVideo = video;
 
-  $('modal-thumb').src       = video.thumbnail || `https://img.youtube.com/vi/${video.id}/mqdefault.jpg`;
+  $('modal-thumb').src            = video.thumbnail || `https://img.youtube.com/vi/${video.id}/mqdefault.jpg`;
   $('modal-title').textContent    = video.title;
   $('modal-channel').textContent  = video.channel || '';
   $('modal-duration').textContent = video.durationStr ? `Duration: ${video.durationStr}` : '';
 
+  const btnStream   = $('modal-btn-stream');
   const btnDownload = $('modal-btn-download');
   const btnPlay     = $('modal-btn-play');
+  const btnDelete   = $('modal-btn-delete');
+
+  // Stream button is hidden for now
+  btnStream.classList.add('hidden');
 
   if (isDownloaded) {
+    // Already downloaded — show Play + Delete (local), hide Download
     btnDownload.classList.add('hidden');
     btnPlay.classList.remove('hidden');
-    Nav.set('modal', 0); // play is idx=1 but download is hidden so play becomes first visible
+    if (btnDelete) btnDelete.classList.remove('hidden');
   } else if (isDownloading) {
     btnDownload.textContent = '⬇ Downloading…';
     btnDownload.disabled    = true;
+    btnDownload.classList.remove('hidden');
     btnPlay.classList.add('hidden');
-    Nav.set('modal', 0);
+    if (btnDelete) btnDelete.classList.add('hidden');
   } else {
     btnDownload.textContent = '⬇ Download';
     btnDownload.disabled    = false;
+    btnDownload.classList.remove('hidden');
     btnPlay.classList.add('hidden');
-    Nav.set('modal', 0);
+    if (btnDelete) btnDelete.classList.add('hidden');
   }
 
   $('modal-video').classList.remove('hidden');
+  Nav.set('modal', 0);
 }
 
 function closeModal() {
@@ -570,6 +631,51 @@ async function downloadSelected() {
   } catch (err) {
     showToast('Download failed: ' + err.message.slice(0, 60));
   }
+}
+
+/**
+ * Stream a YouTube video directly (ad-free) via the server proxy.
+ * The server calls yt-dlp --get-url to extract the raw CDN URL,
+ * then pipes the bytes — so no ads, no YouTube player involved.
+ */
+async function streamVideo() {
+  const v = State.selectedVideo;
+  if (!v) return;
+
+  closeModal();
+
+  // Show the player immediately with a loading indicator
+  const video = $('video-player');
+  $('player-title-text').textContent = v.title;
+  showScreen('player');
+  Nav.set('player', 1);
+  showPlayerUI();
+
+  showToast('⏳ Fetching stream… (1–3 sec)');
+
+  // Point the <video> src directly at our proxy endpoint.
+  // The server calls yt-dlp --print urls --skip-download, extracts a progressive
+  // CDN URL and pipes bytes back. No YouTube player = no ads.
+  const streamSrc = `${SERVER}/api/stream-yt/${encodeURIComponent(v.id)}`;
+  video.src = streamSrc;
+  video.load();
+
+  // Listen for errors so we can show a useful message instead of black screen
+  video.onerror = async () => {
+    let detail = 'Could not load stream';
+    try {
+      // Try to fetch the error body from the server (the endpoint sends JSON on failure)
+      const r = await fetch(streamSrc, { method: 'HEAD' });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        detail = body.error || body.detail || `HTTP ${r.status}`;
+      }
+    } catch { /* ignore */ }
+    showToast(`⚠ Stream failed: ${detail}. Check Logs for details.`);
+    closePlayer();
+  };
+
+  video.play().catch(() => {});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -752,7 +858,27 @@ async function init() {
   });
 
   // ── Modal ──
+  $('modal-btn-stream').addEventListener('click',   streamVideo);
   $('modal-btn-download').addEventListener('click', downloadSelected);
+  $('modal-btn-delete').addEventListener('click', async () => {
+    const v = State.selectedVideo;
+    if (!v) return;
+    const file = State.libraryFiles.find(f => f.videoId === v.id);
+    if (file) {
+      try {
+        await api.delete(`/api/library/${encodeURIComponent(file.filename)}`);
+        showToast('Video deleted');
+        closeModal();
+        await loadLibrary();
+        if (State.section === 'home') await loadHome();
+        if (State.section === 'search') await doSearch();
+      } catch (e) {
+        showToast('Failed to delete video');
+      }
+    } else {
+      showToast('File not found in library');
+    }
+  });
   $('modal-btn-close').addEventListener('click',    closeModal);
   $('modal-backdrop').addEventListener('click',     closeModal);
   $('modal-btn-play').addEventListener('click', () => {
