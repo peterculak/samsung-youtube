@@ -137,30 +137,39 @@ app.post('/api/auth/verify', async (_req, res) => {
 // Home Feed
 // ─────────────────────────────────────────────────────────────────────────────
 
-let homeCache   = null;
-let homeCacheTs = 0;
+let homeCache   = {};
+let homeCacheTs = {};
 const HOME_TTL  = 10 * 60 * 1000; // 10 minutes
 
-app.get('/api/home', async (_req, res) => {
+app.get('/api/home', async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const pageSize = 24;
+  const start = (page - 1) * pageSize + 1;
+  const end = page * pageSize;
+
   const now = Date.now();
-  if (homeCache && now - homeCacheTs < HOME_TTL) return res.json(homeCache);
+  if (homeCache[page] && now - (homeCacheTs[page] || 0) < HOME_TTL) {
+    return res.json(homeCache[page]);
+  }
 
   try {
-    // If authenticated: show personal subscription feed
+    // If authenticated: show personal customized homepage
     // If not: show YouTube trending (no login needed)
     const url = authState.status === 'authenticated'
-      ? 'https://www.youtube.com/feed/subscriptions'
+      ? 'https://www.youtube.com/'
       : 'https://www.youtube.com/feed/trending';
 
     const args = [
       ...cookieArgs(),
-      '--flat-playlist', '--no-warnings', '--playlist-end', '24',
+      '--flat-playlist', '--no-warnings', 
+      '--playlist-start', String(start), 
+      '--playlist-end', String(end),
     ];
 
     const videos = await ytdlpJson([...args, url]);
-    homeCache   = { videos, source: authState.status === 'authenticated' ? 'subscriptions' : 'trending' };
-    homeCacheTs = now;
-    res.json(homeCache);
+    homeCache[page]   = { videos, source: authState.status === 'authenticated' ? 'homepage' : 'trending', page };
+    homeCacheTs[page] = now;
+    res.json(homeCache[page]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -608,22 +617,34 @@ function ytdlpJson(args) {
     proc.stderr.on('data', d => { err += d; });
     proc.on('close', (code) => {
       if (code !== 0) return reject(new Error((err || '').slice(0, 300) || `yt-dlp exit ${code}`));
-      const videos = out.trim().split('\n').filter(Boolean).map(line => {
+      
+      let parsedObjects = [];
+      const lines = out.trim().split('\n').filter(Boolean);
+      for (const line of lines) {
         try {
-          const v = JSON.parse(line);
-          const thumb = (v.thumbnails && v.thumbnails.at(-1)?.url) || v.thumbnail
-            || `https://img.youtube.com/vi/${v.id}/mqdefault.jpg`;
-          return {
-            id:          v.id,
-            title:       v.title || v.fulltitle || v.id,
-            thumbnail:   thumb,
-            duration:    v.duration    || 0,
-            durationStr: formatDuration(v.duration),
-            channel:     v.channel     || v.uploader || '',
-            viewCount:   v.view_count  || 0,
-            uploadDate:  v.upload_date || '',
-          };
-        } catch { return null; }
+          const obj = JSON.parse(line);
+          if (obj._type === 'playlist' && Array.isArray(obj.entries)) {
+            parsedObjects.push(...obj.entries);
+          } else {
+            parsedObjects.push(obj);
+          }
+        } catch { /* ignore */ }
+      }
+
+      const videos = parsedObjects.map(v => {
+        if (!v || !v.id) return null;
+        const thumb = (v.thumbnails && v.thumbnails.at(-1)?.url) || v.thumbnail
+          || `https://img.youtube.com/vi/${v.id}/mqdefault.jpg`;
+        return {
+          id:          v.id,
+          title:       v.title || v.fulltitle || v.id,
+          thumbnail:   thumb,
+          duration:    v.duration    || 0,
+          durationStr: formatDuration(v.duration),
+          channel:     v.channel     || v.uploader || '',
+          viewCount:   v.view_count  || 0,
+          uploadDate:  v.upload_date || '',
+        };
       }).filter(Boolean);
       resolve(videos);
     });

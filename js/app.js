@@ -305,7 +305,7 @@ function transitionToMain(authData) {
   // Update home title based on whether we have auth
   const isAuthed = authData && authData.status === 'authenticated';
   const homeTitle = $('home-title');
-  if (homeTitle) homeTitle.textContent = isAuthed ? 'Subscriptions' : 'Trending';
+  if (homeTitle) homeTitle.textContent = isAuthed ? 'Recommended' : 'Trending';
 
   showScreen('main');
   showSection('home');
@@ -317,17 +317,85 @@ function transitionToMain(authData) {
 // ─────────────────────────────────────────────────────────────────────────────
 // HOME FEED
 // ─────────────────────────────────────────────────────────────────────────────
-async function loadHome() {
+let homePage = 1;
+let prefetchPromise = null;
+let isLoadingMore = false;
+let homeObserver = null;
+
+async function fetchHomeVideos(page) {
+  try {
+    const data = await api.get(`/api/home?page=${page}`);
+    return data.videos || [];
+  } catch (err) {
+    console.error("Failed to fetch home page", page, err);
+    return [];
+  }
+}
+
+async function loadHome(loadMore = false) {
   const grid = $('grid-home');
-  grid.innerHTML = renderSkeletons(12);
+  
+  if (!loadMore) {
+    homePage = 1;
+    isLoadingMore = false;
+    prefetchPromise = null;
+    if (homeObserver) {
+      homeObserver.disconnect();
+      homeObserver = null;
+    }
+    const sentinel = document.getElementById('home-sentinel');
+    if (sentinel) sentinel.remove();
+    grid.innerHTML = renderSkeletons(12);
+  } else {
+    if (isLoadingMore) return;
+    isLoadingMore = true;
+    homePage++;
+    const sentinel = document.getElementById('home-sentinel');
+    if (sentinel) sentinel.remove(); // Remove sentinel, it'll be re-appended after new items
+    grid.insertAdjacentHTML('beforeend', renderSkeletons(4));
+  }
 
   try {
-    const data = await api.get('/api/home');
-    State.homeVideos = data.videos || [];
-    renderVideoGrid(grid, State.homeVideos);
-    Nav.set('content', 0);
+    const newVideos = loadMore 
+      ? (prefetchPromise ? await prefetchPromise : await fetchHomeVideos(homePage))
+      : await fetchHomeVideos(homePage);
+
+    if (loadMore) {
+      grid.querySelectorAll('.skel-card').forEach(e => e.remove());
+      State.homeVideos.push(...newVideos);
+      renderVideoGrid(grid, newVideos, true); // We'll update renderVideoGrid to support append
+    } else {
+      State.homeVideos = newVideos;
+      renderVideoGrid(grid, State.homeVideos, false);
+    }
+    
+    if (newVideos && newVideos.length > 0) {
+      // Add sentinel for IntersectionObserver
+      const sentinel = document.createElement('div');
+      sentinel.id = 'home-sentinel';
+      sentinel.style.gridColumn = '1 / -1';
+      sentinel.style.height = '10px';
+      grid.appendChild(sentinel);
+
+      if (homeObserver) homeObserver.disconnect();
+      homeObserver = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting && !isLoadingMore) {
+          loadHome(true);
+        }
+      }, { rootMargin: '400px' });
+      homeObserver.observe(sentinel);
+
+      // Start prefetching next page
+      prefetchPromise = fetchHomeVideos(homePage + 1);
+    }
+    
+    if (!loadMore) Nav.set('content', 0);
   } catch (err) {
-    grid.innerHTML = renderEmpty('⊞', 'Could not load subscriptions', err.message.slice(0, 100));
+    if (!loadMore) {
+      grid.innerHTML = renderEmpty('⊞', 'Could not load home', err.message.slice(0, 100));
+    }
+  } finally {
+    isLoadingMore = false;
   }
 }
 
@@ -494,18 +562,20 @@ function startJobPolling() {
 // ─────────────────────────────────────────────────────────────────────────────
 // VIDEO GRID (home + search)
 // ─────────────────────────────────────────────────────────────────────────────
-function renderVideoGrid(grid, videos) {
-  if (!videos.length) {
+function renderVideoGrid(grid, videos, append = false) {
+  if (!videos.length && !append) {
     grid.innerHTML = renderEmpty('⊞', 'No videos found', '');
     return;
   }
-  grid.innerHTML = '';
+  if (!append) grid.innerHTML = '';
 
   // Build lookup sets for badge display
   const downloadedIds  = new Set(State.libraryFiles.map(f => f.videoId).filter(Boolean));
   const downloadingIds = new Set(
     State.jobs.filter(j => ['queued', 'downloading', 'processing'].includes(j.status)).map(j => j.videoId)
   );
+
+  const startIdx = append ? grid.querySelectorAll('.video-card').length : 0;
 
   videos.forEach((v, i) => {
     const isDownloaded  = downloadedIds.has(v.id);
@@ -516,7 +586,7 @@ function renderVideoGrid(grid, videos) {
     else if (isDownloading) badge = '<div class="card-badge badge-downloading">⬇ Downloading</div>';
 
     const card = makeCard({
-      idx:       i,
+      idx:       startIdx + i,
       title:     v.title,
       channel:   v.channel,
       thumbnail: v.thumbnail || `https://img.youtube.com/vi/${v.id}/mqdefault.jpg`,
