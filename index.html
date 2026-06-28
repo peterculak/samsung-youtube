@@ -86,6 +86,24 @@
         <h2 id="home-title">Home</h2>
         <button class="btn-icon" id="btn-refresh-home" data-focuszone="home-header" data-focusidx="0">↻ Refresh</button>
       </div>
+      
+      <div class="chips-wrapper" style="overflow-x: auto; white-space: nowrap; margin-bottom: 20px; padding-bottom: 10px; scrollbar-width: none;">
+        <div id="home-chips" class="chips-container" style="display: inline-flex; gap: 10px;">
+          <button class="chip active" data-topic="All" data-focuszone="chips" data-focusidx="0" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">All</button>
+          <button class="chip" data-topic="Music" data-focuszone="chips" data-focusidx="1" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Music</button>
+          <button class="chip" data-topic="Gaming" data-focuszone="chips" data-focusidx="2" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Gaming</button>
+          <button class="chip" data-topic="News" data-focuszone="chips" data-focusidx="3" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">News</button>
+          <button class="chip" data-topic="Comedy" data-focuszone="chips" data-focusidx="4" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Comedy</button>
+          <button class="chip" data-topic="Podcasts" data-focuszone="chips" data-focusidx="5" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Podcasts</button>
+          <button class="chip" data-topic="Programming" data-focuszone="chips" data-focusidx="6" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Programming</button>
+        </div>
+      </div>
+      <style>
+        .chips-wrapper::-webkit-scrollbar { display: none; }
+        .chip.focused, .chip:focus { outline: 3px solid var(--text); outline-offset: 2px; }
+        .chip.active { background: var(--text) !important; color: var(--bg) !important; font-weight: bold; }
+      </style>
+
       <div id="grid-home" class="video-grid"></div>
     </section>
 

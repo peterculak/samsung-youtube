@@ -58,6 +58,18 @@ const BROWSER = process.env.BROWSER || 'chrome';
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR
   || path.resolve(__dirname, '../../../../ta3-cli/downloads/youtube');
 
+// Background cache refresh interval (default 30 min). Override with CACHE_REFRESH_MS env var.
+const CACHE_REFRESH_MS = parseInt(process.env.CACHE_REFRESH_MS) || 30 * 60 * 1000;
+
+// Number of pages to pre-cache per topic
+const CACHE_PAGES = 10;
+
+// Max concurrent yt-dlp processes during cache warm. Override with CACHE_CONCURRENCY env var.
+const CACHE_CONCURRENCY = parseInt(process.env.CACHE_CONCURRENCY) || 4;
+
+// Topics to cache (chip categories + home)
+const CHIP_TOPICS = ['Music', 'Gaming', 'News', 'Comedy', 'Podcasts', 'Programming'];
+
 app.use(cors());
 app.use(express.json());
 // Serve the Tizen web app (parent directory = YoutubeDownloader/)
@@ -72,6 +84,8 @@ let authState = {
   status:  'checking', // checking | authenticated | unauthenticated | error
   browser: BROWSER,
   message: '',
+  userId:  null,       // Stable ID derived from the YouTube account (e.g. channel handle)
+  displayName: null,   // Human-readable account name shown in the UI
 };
 
 /**
@@ -85,23 +99,50 @@ function cookieArgs() {
 }
 
 /**
- * Runs a quick yt-dlp --simulate to check if browser cookies give us YouTube access.
- * Resolves to true if authenticated, false otherwise.
+ * Derive a stable userId from the current browser session.
+ * We run yt-dlp on a known YouTube URL that returns the uploader/channel
+ * of the logged-in user. Falls back to 'anonymous'.
  */
-function checkAuth() {
+async function detectUserId() {
   return new Promise((resolve) => {
+    // Use the YouTube homepage's channel_url as user identity signal.
+    // --flat-playlist --playlist-items 1 exits quickly after the first item.
     const proc = spawn('yt-dlp', [
       '--cookies-from-browser', BROWSER,
-      '--simulate', '--quiet', '--no-warnings',
-      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      '--flat-playlist', '--playlist-items', '1',
+      '--print', 'uploader_id',
+      '--no-warnings', '--quiet',
+      'https://www.youtube.com/',
     ]);
-    let errOut = '';
-    proc.stderr.on('data', d => { errOut += d.toString(); });
-    proc.on('close', code => resolve(code === 0));
-    proc.on('error', () => resolve(false));
-    // Timeout after 20 s
-    setTimeout(() => { proc.kill(); resolve(false); }, 20000);
+    let out = '';
+    proc.stdout.on('data', d => { out += d.toString(); });
+    proc.on('close', () => {
+      const id = out.trim().split('\n')[0]?.trim();
+      resolve(id && id.length > 0 ? `yt_${id}` : 'authenticated_user');
+    });
+    proc.on('error', () => resolve('authenticated_user'));
+    setTimeout(() => { proc.kill(); resolve('authenticated_user'); }, 15000);
   });
+}
+
+/**
+ * Checks if browser cookies give us authenticated YouTube access.
+ * Uses ytdlpJson() directly — the exact same code path as real home feed fetches.
+ * If fetching one video from the homepage works, auth is confirmed.
+ */
+async function checkAuth() {
+  try {
+    const videos = await ytdlpJson([
+      '--cookies-from-browser', BROWSER,
+      '--flat-playlist', '--no-warnings',
+      '--playlist-items', '1',
+      'https://www.youtube.com/',
+    ]);
+    return videos.length > 0;
+  } catch (err) {
+    log('auth', `checkAuth failed: ${err.message.slice(0, 120)}`);
+    return false;
+  }
 }
 
 // Run auth check on startup
@@ -112,10 +153,21 @@ function checkAuth() {
     authState.status  = 'authenticated';
     authState.message = `Using ${BROWSER} cookies`;
     console.log(`[auth] ✓ Authenticated via ${BROWSER}`);
+    // Detect user identity in background (non-blocking)
+    detectUserId().then(userId => {
+      authState.userId = userId;
+      authState.displayName = userId.replace(/^yt_@?/, '');
+      log('auth', `User ID: ${userId}`);
+      // Start cache warming for this user
+      scheduleWarmCache(userId);
+    });
   } else {
     authState.status  = 'unauthenticated';
+    authState.userId  = 'anonymous';
     authState.message = `Log into YouTube in ${BROWSER} on this Mac, then click Verify`;
     console.log(`[auth] ✗ Not authenticated — log into YouTube in ${BROWSER}`);
+    // Still warm the anonymous/trending cache
+    scheduleWarmCache('anonymous');
   }
 })();
 
@@ -126,69 +178,322 @@ app.get('/api/auth/status', (_req, res) => res.json(authState));
 app.post('/api/auth/verify', async (_req, res) => {
   authState.status = 'checking';
   const ok = await checkAuth();
-  authState.status  = ok ? 'authenticated' : 'unauthenticated';
-  authState.message = ok
-    ? `Using ${BROWSER} cookies`
-    : `Log into YouTube in ${BROWSER} on this Mac, then click Verify`;
+  if (ok) {
+    authState.status  = 'authenticated';
+    authState.message = `Using ${BROWSER} cookies`;
+    // Detect user ID and warm their cache
+    const userId = await detectUserId();
+    authState.userId = userId;
+    authState.displayName = userId.replace(/^yt_@?/, '');
+    log('auth', `Verified as userId: ${userId}`);
+    // Start warming this user's cache if not already done
+    scheduleWarmCache(userId);
+  } else {
+    authState.status  = 'unauthenticated';
+    authState.userId  = 'anonymous';
+    authState.displayName = null;
+    authState.message = `Log into YouTube in ${BROWSER} on this Mac, then click Verify`;
+  }
   res.json(authState);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Home Feed
+// Per-User Content Cache
+//
+// Structure:
+//   contentCache[userId][topic][page] = {
+//     videos:    [...],
+//     fetchedAt: <timestamp ms>,
+//     ready:     true,
+//   }
+//
+// 'topic' is either 'home' or a chip label like 'Music', 'Gaming', etc.
+// userId is derived from the YouTube account handle (or 'anonymous').
+// Cache is NEVER evicted on logout — switching users re-uses the existing cache.
 // ─────────────────────────────────────────────────────────────────────────────
 
-let homeCache   = {};
-let homeCacheTs = {};
-const HOME_TTL  = 10 * 60 * 1000; // 10 minutes
+const contentCache = {};        // userId → topic → page → entry
+const warmingLock  = {};        // userId → boolean (prevents concurrent warm runs)
+const refreshTimers = {};       // userId → timer handle
 
-app.get('/api/home', async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
+function getUserCache(userId) {
+  if (!contentCache[userId]) {
+    contentCache[userId] = {};
+  }
+  return contentCache[userId];
+}
+
+function getCacheEntry(userId, topic, page) {
+  const uc = getUserCache(userId);
+  if (!uc[topic]) uc[topic] = {};
+  return uc[topic][page] || null;
+}
+
+function setCacheEntry(userId, topic, page, videos) {
+  const uc = getUserCache(userId);
+  if (!uc[topic]) uc[topic] = {};
+  uc[topic][page] = { videos, fetchedAt: Date.now(), ready: true };
+}
+
+/**
+ * Fetch videos for a given topic+page using yt-dlp.
+ * Always uses cookies — userId is only used as a cache key, not an auth gate.
+ * Home always uses https://www.youtube.com/ (works for both authed + unauthed;
+ * the trending URL is broken in recent yt-dlp versions).
+ */
+async function fetchVideosForTopic(userId, topic, page) {
   const pageSize = 24;
   const start = (page - 1) * pageSize + 1;
-  const end = page * pageSize;
+  const end   = page * pageSize;
 
-  const now = Date.now();
-  if (homeCache[page] && now - (homeCacheTs[page] || 0) < HOME_TTL) {
-    return res.json(homeCache[page]);
+  // Always try cookies — if the user is logged in, content is personalised;
+  // if not, YouTube just ignores the cookies and returns generic content.
+  const cookies = ['--cookies-from-browser', BROWSER];
+
+  if (topic === 'home') {
+    // https://www.youtube.com/ works for both logged-in (personalised) and
+    // logged-out (generic) users. feed/trending is broken in recent yt-dlp.
+    return ytdlpJson([
+      ...cookies,
+      '--flat-playlist', '--no-warnings',
+      '--playlist-start', String(start),
+      '--playlist-end',   String(end),
+      'https://www.youtube.com/',
+    ]);
+  } else {
+    return ytdlpJson([
+      ...cookies,
+      '--flat-playlist', '--no-warnings',
+      '--playlist-start', String(start),
+      '--playlist-end',   String(end),
+      `ytsearchall:${topic}`,
+    ]);
+  }
+}
+
+/**
+ * Warm the cache for a given user — fetches CACHE_PAGES pages for every topic.
+ * Pages are fetched sequentially to avoid hammering yt-dlp.
+ * Already-cached entries that are still fresh (< CACHE_REFRESH_MS) are skipped.
+ */
+async function warmCache(userId) {
+  if (warmingLock[userId]) {
+    log('cache', `[${userId}] Warm already in progress — skipping`);
+    return;
+  }
+  warmingLock[userId] = true;
+
+  const topics = ['home', ...CHIP_TOPICS];
+
+  // Build a flat queue of all (topic, page) pairs that need fetching
+  const queue = [];
+  for (const topic of topics) {
+    for (let page = 1; page <= CACHE_PAGES; page++) {
+      const existing = getCacheEntry(userId, topic, page);
+      if (existing && (Date.now() - existing.fetchedAt) < CACHE_REFRESH_MS) continue;
+      queue.push({ topic, page });
+    }
   }
 
+  if (queue.length === 0) {
+    log('cache', `[${userId}] All ${topics.length * CACHE_PAGES} pages are fresh — skipping warm`);
+    warmingLock[userId] = false;
+    return;
+  }
+
+  log('cache', `[${userId}] Warming ${queue.length} pages with concurrency=${CACHE_CONCURRENCY}`);
+  const t0 = Date.now();
+
+  // Concurrency-limited parallel fetcher
+  // Each worker drains the shared queue independently
+  let idx = 0;
+  async function worker() {
+    while (true) {
+      const item = queue[idx++];
+      if (!item) break;
+      const { topic, page } = item;
+      try {
+        const videos = await fetchVideosForTopic(userId, topic, page);
+        setCacheEntry(userId, topic, page, videos);
+        log('cache', `[${userId}] ✓ ${topic} p${page} — ${videos.length} videos`);
+      } catch (err) {
+        log('cache', `[${userId}] ✗ ${topic} p${page} — ${err.message.slice(0, 80)}`);
+        // Don't abort — other workers continue
+      }
+    }
+  }
+
+  // Launch CACHE_CONCURRENCY workers and wait for all to drain the queue
+  await Promise.allSettled(
+    Array.from({ length: Math.min(CACHE_CONCURRENCY, queue.length) }, worker)
+  );
+
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  log('cache', `[${userId}] Cache warm complete in ${elapsed}s`);
+  warmingLock[userId] = false;
+}
+
+/**
+ * Schedule periodic cache refresh for a user.
+ * On first call, immediately starts warming; subsequent runs repeat every CACHE_REFRESH_MS.
+ */
+function scheduleWarmCache(userId) {
+  // Avoid duplicate timers for the same user
+  if (refreshTimers[userId]) return;
+
+  // Warm immediately (non-blocking)
+  warmCache(userId).catch(err => log('cache', `[${userId}] Warm error: ${err.message}`));
+
+  // Then refresh on a schedule
+  refreshTimers[userId] = setInterval(() => {
+    log('cache', `[${userId}] Scheduled refresh triggered`);
+    warmCache(userId).catch(err => log('cache', `[${userId}] Refresh error: ${err.message}`));
+  }, CACHE_REFRESH_MS);
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache Status endpoint — useful for debugging
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/cache/status', (_req, res) => {
+  const summary = {};
+  for (const [userId, topicMap] of Object.entries(contentCache)) {
+    summary[userId] = {};
+    for (const [topic, pages] of Object.entries(topicMap)) {
+      summary[userId][topic] = {
+        pagesReady: Object.values(pages).filter(e => e.ready).length,
+        pages: Object.fromEntries(
+          Object.entries(pages).map(([page, e]) => [
+            page,
+            {
+              ready:     e.ready,
+              count:     e.videos?.length ?? 0,
+              fetchedAt: e.fetchedAt ? new Date(e.fetchedAt).toISOString() : null,
+              ageMs:     e.fetchedAt ? Date.now() - e.fetchedAt : null,
+            }
+          ])
+        )
+      };
+    }
+  }
+  res.json({
+    currentUserId:  authState.userId,
+    refreshIntervalMs: CACHE_REFRESH_MS,
+    cachePages: CACHE_PAGES,
+    warmingNow: Object.entries(warmingLock)
+      .filter(([, v]) => v)
+      .map(([k]) => k),
+    users: summary,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Home Feed — served from cache; falls back to live fetch on cache miss
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/home', async (req, res) => {
+  const page   = parseInt(req.query.page) || 1;
+  const userId = authState.userId || 'anonymous';
+
+  // Serve from cache if available
+  const cached = getCacheEntry(userId, 'home', page);
+  if (cached?.ready) {
+    return res.json({
+      videos:   cached.videos,
+      source:   authState.status === 'authenticated' ? 'homepage' : 'trending',
+      page,
+      cached:   true,
+      cachedAt: cached.fetchedAt,
+    });
+  }
+
+  // Cache miss — fetch live and populate cache
+  log('cache', `[${userId}] home p${page} cache miss — fetching live`);
   try {
-    // If authenticated: show personal customized homepage
-    // If not: show YouTube trending (no login needed)
-    const url = authState.status === 'authenticated'
-      ? 'https://www.youtube.com/'
-      : 'https://www.youtube.com/feed/trending';
-
-    const args = [
-      ...cookieArgs(),
-      '--flat-playlist', '--no-warnings', 
-      '--playlist-start', String(start), 
-      '--playlist-end', String(end),
-    ];
-
-    const videos = await ytdlpJson([...args, url]);
-    homeCache[page]   = { videos, source: authState.status === 'authenticated' ? 'homepage' : 'trending', page };
-    homeCacheTs[page] = now;
-    res.json(homeCache[page]);
+    const videos = await fetchVideosForTopic(userId, 'home', page);
+    setCacheEntry(userId, 'home', page, videos);
+    res.json({
+      videos,
+      source:  authState.status === 'authenticated' ? 'homepage' : 'trending',
+      page,
+      cached:  false,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Search
+// Chip Categories — served from cache; falls back to live fetch on cache miss
+// Client should use this endpoint for chip tabs (Music, Gaming, etc.)
+// NOT for user-typed search (use /api/search for that).
 // ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/chips', async (req, res) => {
+  const topic  = (req.query.topic || '').trim();
+  const page   = parseInt(req.query.page) || 1;
+  const userId = authState.userId || 'anonymous';
+
+  if (!topic) return res.status(400).json({ error: 'topic is required' });
+
+  // Serve from cache if available
+  const cached = getCacheEntry(userId, topic, page);
+  if (cached?.ready) {
+    return res.json({
+      videos:   cached.videos,
+      topic,
+      page,
+      cached:   true,
+      cachedAt: cached.fetchedAt,
+    });
+  }
+
+  // Cache miss — fetch live
+  log('cache', `[${userId}] chips/${topic} p${page} cache miss — fetching live`);
+  try {
+    const videos = await fetchVideosForTopic(userId, topic, page);
+    setCacheEntry(userId, topic, page, videos);
+    res.json({ videos, topic, page, cached: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Search — always live, no persistent cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+let searchCache   = {};
+let searchCacheTs = {};
+const SEARCH_TTL  = 10 * 60 * 1000; // 10 min short TTL for search dedup
 
 app.get('/api/search', async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q is required' });
 
+  const page     = parseInt(req.query.page) || 1;
+  const pageSize = 24;
+  const start    = (page - 1) * pageSize + 1;
+  const end      = page * pageSize;
+
+  const cacheKey = `${q}_${page}`;
+  const now      = Date.now();
+  if (searchCache[cacheKey] && now - (searchCacheTs[cacheKey] || 0) < SEARCH_TTL) {
+    return res.json({ videos: searchCache[cacheKey], cached: true });
+  }
+
   try {
     const videos = await ytdlpJson([
+      ...cookieArgs(),
       '--flat-playlist', '--no-warnings',
-      `ytsearch20:${q}`,
+      '--playlist-start', String(start),
+      '--playlist-end',   String(end),
+      `ytsearchall:${q}`,
     ]);
-    res.json({ videos });
+    searchCache[cacheKey]   = videos;
+    searchCacheTs[cacheKey] = now;
+    res.json({ videos, cached: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -664,6 +969,7 @@ app.listen(PORT, () => {
   console.log(`🚀  Server →  http://localhost:${PORT}`);
   console.log(`📁  Downloads: ${DOWNLOAD_DIR}`);
   console.log(`🌐  Browser:   ${BROWSER}`);
+  console.log(`⚡  Cache:     ${CACHE_PAGES} pages × ${['home', ...CHIP_TOPICS].length} topics, refresh every ${CACHE_REFRESH_MS / 60000}min`);
   console.log('');
   console.log('Open the app → http://localhost:' + PORT);
 });

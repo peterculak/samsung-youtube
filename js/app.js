@@ -55,6 +55,7 @@ const State = {
   screen:       'login',   // login | main | player
   section:      'home',    // home | search | library | downloads
 
+  homeTopic:    'All',
   homeVideos:   [],
   searchVideos: [],
   libraryFiles: [],
@@ -301,6 +302,8 @@ async function verifyAuth() {
   }
 }
 
+// prefetchChips() removed — server warms chip cache on startup via /api/chips
+
 function transitionToMain(authData) {
   // Update home title based on whether we have auth
   const isAuthed = authData && authData.status === 'authenticated';
@@ -322,12 +325,30 @@ let prefetchPromise = null;
 let isLoadingMore = false;
 let homeObserver = null;
 
+// Bind chips click
+document.querySelectorAll('#home-chips .chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    document.querySelectorAll('#home-chips .chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    chip.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    State.homeTopic = chip.dataset.topic;
+    loadHome(false);
+  });
+});
+
 async function fetchHomeVideos(page) {
   try {
-    const data = await api.get(`/api/home?page=${page}`);
+    // Home tab uses /api/home (personal feed or trending).
+    // Chip tabs use /api/chips which is served from the server-side cache
+    // (pre-warmed on startup, refreshed every 30 min).
+    // User-typed search always goes through /api/search (live, no persistent cache).
+    const url = State.homeTopic === 'All'
+      ? `/api/home?page=${page}`
+      : `/api/chips?topic=${encodeURIComponent(State.homeTopic)}&page=${page}`;
+    const data = await api.get(url);
     return data.videos || [];
   } catch (err) {
-    console.error("Failed to fetch home page", page, err);
+    console.error('Failed to fetch home page', page, err);
     return [];
   }
 }
@@ -762,7 +783,7 @@ async function loadLogs() {
   const c = $('logs-list');
   c.innerHTML = '<div class="spinner"></div>';
   try {
-    const logs = await apiFetch('/api/logs');
+    const logs = await api.get('/api/logs');
     if (!logs.length) {
       c.innerHTML = '<div class="empty-state">No logs available.</div>';
       Nav.set('sidebar', Nav.sidebarIdx());
