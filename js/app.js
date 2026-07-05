@@ -314,6 +314,11 @@ function transitionToMain(authData) {
   if (userBtn && isAuthed && authData.displayName) {
     const avatarEl = $('sidebar-user-avatar');
     const nameEl   = $('sidebar-user-name');
+    
+    // Hide default logo
+    const logoEl = document.querySelector('.sidebar-logo');
+    if (logoEl) logoEl.style.display = 'none';
+
     if (nameEl) nameEl.textContent = authData.displayName;
     if (avatarEl && authData.avatarUrl) {
       avatarEl.src = authData.avatarUrl;
@@ -1038,7 +1043,13 @@ async function init() {
         const avatarEl = $('sidebar-user-avatar');
         const nameEl   = $('sidebar-user-name');
         const userBtn  = $('sidebar-user-btn');
-        if (avatarEl && avatarEl.src !== s.avatarUrl) avatarEl.src = s.avatarUrl;
+        const logoEl   = document.querySelector('.sidebar-logo');
+
+        if (logoEl) logoEl.style.display = 'none';
+        if (avatarEl && avatarEl.src !== s.avatarUrl) {
+          avatarEl.src = s.avatarUrl;
+          avatarEl.style.display = 'block';
+        }
         if (nameEl && s.displayName) nameEl.textContent = s.displayName;
         if (userBtn) userBtn.style.display = 'flex';
       }
