@@ -305,10 +305,22 @@ async function verifyAuth() {
 // prefetchChips() removed — server warms chip cache on startup via /api/chips
 
 function transitionToMain(authData) {
-  // Update home title based on whether we have auth
   const isAuthed = authData && authData.status === 'authenticated';
   const homeTitle = $('home-title');
   if (homeTitle) homeTitle.textContent = isAuthed ? 'Recommended' : 'Trending';
+
+  // Show user profile in sidebar
+  const userBtn = $('sidebar-user-btn');
+  if (userBtn && isAuthed && authData.displayName) {
+    const avatarEl = $('sidebar-user-avatar');
+    const nameEl   = $('sidebar-user-name');
+    if (nameEl) nameEl.textContent = authData.displayName;
+    if (avatarEl && authData.avatarUrl) {
+      avatarEl.src = authData.avatarUrl;
+      avatarEl.style.display = 'block';
+    }
+    userBtn.style.display = 'flex';
+  }
 
   showScreen('main');
   showSection('home');
@@ -993,7 +1005,6 @@ async function init() {
     if (status.status === 'authenticated') {
       transitionToMain(status);
     } else if (status.status === 'checking') {
-      // Server is still doing the initial cookie check — poll until done
       msgEl.textContent = 'Checking Chrome cookies…';
       const poll = setInterval(async () => {
         try {
@@ -1018,6 +1029,21 @@ async function init() {
     showToast('⚠ Cannot reach server at ' + SERVER);
     Nav.set('login', 0);
   }
+
+  // Poll auth status every 5 seconds — once authenticated, update the avatar without full reload
+  setInterval(async () => {
+    try {
+      const s = await api.get('/api/auth/status');
+      if (s.status === 'authenticated' && s.avatarUrl && State.screen === 'main') {
+        const avatarEl = $('sidebar-user-avatar');
+        const nameEl   = $('sidebar-user-name');
+        const userBtn  = $('sidebar-user-btn');
+        if (avatarEl && avatarEl.src !== s.avatarUrl) avatarEl.src = s.avatarUrl;
+        if (nameEl && s.displayName) nameEl.textContent = s.displayName;
+        if (userBtn) userBtn.style.display = 'flex';
+      }
+    } catch { /* ignore */ }
+  }, 5000);
 }
 
 document.addEventListener('DOMContentLoaded', init);

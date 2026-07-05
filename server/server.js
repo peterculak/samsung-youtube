@@ -84,8 +84,9 @@ let authState = {
   status:  'checking', // checking | authenticated | unauthenticated | error
   browser: BROWSER,
   message: '',
-  userId:  null,       // Stable ID derived from the YouTube account (e.g. channel handle)
-  displayName: null,   // Human-readable account name shown in the UI
+  userId:  null,
+  displayName: null,
+  avatarUrl: null,
 };
 
 /**
@@ -105,23 +106,68 @@ function cookieArgs() {
  */
 async function detectUserId() {
   return new Promise((resolve) => {
-    // Use the YouTube homepage's channel_url as user identity signal.
-    // --flat-playlist --playlist-items 1 exits quickly after the first item.
+    // Get uploader_id AND channel_url from the first homepage video
     const proc = spawn('yt-dlp', [
       '--cookies-from-browser', BROWSER,
       '--flat-playlist', '--playlist-items', '1',
-      '--print', 'uploader_id',
+      '--print', '%(uploader_id)s\t%(channel_url)s',
       '--no-warnings', '--quiet',
       'https://www.youtube.com/',
     ]);
     let out = '';
     proc.stdout.on('data', d => { out += d.toString(); });
-    proc.on('close', () => {
-      const id = out.trim().split('\n')[0]?.trim();
-      resolve(id && id.length > 0 ? `yt_${id}` : 'authenticated_user');
+    proc.on('close', async () => {
+      const line = out.trim().split('\n')[0]?.trim() || '';
+      const [rawId] = line.split('\t');
+      const userId = rawId && rawId.length > 0 ? `yt_${rawId}` : 'authenticated_user';
+      const displayName = rawId ? rawId.replace(/^@/, '') : 'YouTube User';
+
+      // Try to fetch avatar via youtubei.js (non-blocking, best-effort)
+      let avatarUrl = null;
+      try {
+        const tmpFile = `/tmp/yt_avatar_cookies_${Date.now()}.txt`;
+        // Export cookies to temp file for youtubei.js
+        await new Promise((res2) => {
+          const p = spawn('yt-dlp', ['--cookies-from-browser', BROWSER, '--cookies', tmpFile,
+            '--skip-download', '--no-warnings', '--quiet', '--playlist-items', '0',
+            'https://www.youtube.com/']);
+          p.on('close', res2);
+          p.on('error', res2);
+          setTimeout(() => { p.kill(); res2(); }, 20000);
+        });
+        if (fs.existsSync(tmpFile)) {
+          const lines = fs.readFileSync(tmpFile, 'utf8').split('\n');
+          const cookies = lines
+            .filter(l => !l.startsWith('#') && l.trim() && l.split('\t').length >= 7)
+            .filter(l => l.split('\t')[0].includes('youtube.com'))
+            .map(l => { const p = l.split('\t'); return p[5] + '=' + p[6].trim(); })
+            .join('; ');
+          fs.unlinkSync(tmpFile);
+
+          if (cookies.length > 0) {
+            const { Innertube, Platform } = await import('youtubei.js');
+            const { default: vm } = await import('node:vm');
+            Platform.shim.eval = (data) => {
+              const ctx = vm.createContext({ globalThis: {}, window: {}, document: {}, console, setTimeout, clearTimeout, URL, URLSearchParams });
+              ctx.globalThis = ctx;
+              return new vm.Script(`(function() { ${data.output} })()`).runInContext(ctx);
+            };
+            const yt = await Innertube.create({ retrieve_player: true, cookie: cookies });
+            const info = await yt.account.getInfo();
+            const acc = info?.contents?.contents?.[0];
+            avatarUrl = acc?.account_photo?.[0]?.url || null;
+            const realName = acc?.account_name?.text || null;
+            if (realName) authState.displayName = realName;
+          }
+        }
+      } catch (e) {
+        log('auth', `Avatar fetch failed (non-fatal): ${e.message.slice(0, 80)}`);
+      }
+
+      resolve({ userId, displayName, avatarUrl });
     });
-    proc.on('error', () => resolve('authenticated_user'));
-    setTimeout(() => { proc.kill(); resolve('authenticated_user'); }, 15000);
+    proc.on('error', () => resolve({ userId: 'authenticated_user', displayName: 'YouTube User', avatarUrl: null }));
+    setTimeout(() => { proc.kill(); resolve({ userId: 'authenticated_user', displayName: 'YouTube User', avatarUrl: null }); }, 20000);
   });
 }
 
@@ -154,11 +200,11 @@ async function checkAuth() {
     authState.message = `Using ${BROWSER} cookies`;
     console.log(`[auth] ✓ Authenticated via ${BROWSER}`);
     // Detect user identity in background (non-blocking)
-    detectUserId().then(userId => {
+    detectUserId().then(({ userId, displayName, avatarUrl }) => {
       authState.userId = userId;
-      authState.displayName = userId.replace(/^yt_@?/, '');
-      log('auth', `User ID: ${userId}`);
-      // Start cache warming for this user
+      authState.displayName = displayName;
+      authState.avatarUrl = avatarUrl;
+      log('auth', `User: ${displayName} (${userId}) avatar: ${avatarUrl ? 'yes' : 'no'}`);
       scheduleWarmCache(userId);
     });
   } else {
