@@ -43,6 +43,11 @@ const api = {
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
+  async delete(path) {
+    const r = await fetch(`${SERVER}${path}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  },
 };
 
 // ─── App State ───────────────────────────────────────────────────────────────
@@ -50,6 +55,7 @@ const State = {
   screen:       'login',   // login | main | player
   section:      'home',    // home | search | library | downloads
 
+  homeTopic:    'All',
   homeVideos:   [],
   searchVideos: [],
   libraryFiles: [],
@@ -245,6 +251,7 @@ function showSection(name) {
   if      (name === 'home')      loadHome();
   else if (name === 'library')   loadLibrary();
   else if (name === 'downloads') loadJobs();
+  else if (name === 'logs')      loadLogs();
   else if (name === 'search') {
     Nav.set('searchbar', 0);
     $('search-input').focus();
@@ -295,11 +302,30 @@ async function verifyAuth() {
   }
 }
 
+// prefetchChips() removed — server warms chip cache on startup via /api/chips
+
 function transitionToMain(authData) {
-  // Update home title based on whether we have auth
   const isAuthed = authData && authData.status === 'authenticated';
   const homeTitle = $('home-title');
-  if (homeTitle) homeTitle.textContent = isAuthed ? 'Subscriptions' : 'Trending';
+  if (homeTitle) homeTitle.textContent = isAuthed ? 'Recommended' : 'Trending';
+
+  // Show user profile in sidebar
+  const userBtn = $('sidebar-user-btn');
+  if (userBtn && isAuthed && authData.displayName) {
+    const avatarEl = $('sidebar-user-avatar');
+    const nameEl   = $('sidebar-user-name');
+    
+    // Hide default logo
+    const logoEl = document.querySelector('.sidebar-logo');
+    if (logoEl) logoEl.style.display = 'none';
+
+    if (nameEl) nameEl.textContent = authData.displayName;
+    if (avatarEl && authData.avatarUrl) {
+      avatarEl.src = authData.avatarUrl;
+      avatarEl.style.display = 'block';
+    }
+    userBtn.style.display = 'flex';
+  }
 
   showScreen('main');
   showSection('home');
@@ -311,17 +337,103 @@ function transitionToMain(authData) {
 // ─────────────────────────────────────────────────────────────────────────────
 // HOME FEED
 // ─────────────────────────────────────────────────────────────────────────────
-async function loadHome() {
+let homePage = 1;
+let prefetchPromise = null;
+let isLoadingMore = false;
+let homeObserver = null;
+
+// Bind chips click
+document.querySelectorAll('#home-chips .chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    document.querySelectorAll('#home-chips .chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    chip.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    State.homeTopic = chip.dataset.topic;
+    loadHome(false);
+  });
+});
+
+async function fetchHomeVideos(page) {
+  try {
+    // Home tab uses /api/home (personal feed or trending).
+    // Chip tabs use /api/chips which is served from the server-side cache
+    // (pre-warmed on startup, refreshed every 30 min).
+    // User-typed search always goes through /api/search (live, no persistent cache).
+    const url = State.homeTopic === 'All'
+      ? `/api/home?page=${page}`
+      : `/api/chips?topic=${encodeURIComponent(State.homeTopic)}&page=${page}`;
+    const data = await api.get(url);
+    return data.videos || [];
+  } catch (err) {
+    console.error('Failed to fetch home page', page, err);
+    return [];
+  }
+}
+
+async function loadHome(loadMore = false) {
   const grid = $('grid-home');
-  grid.innerHTML = renderSkeletons(12);
+  
+  if (!loadMore) {
+    homePage = 1;
+    isLoadingMore = false;
+    prefetchPromise = null;
+    if (homeObserver) {
+      homeObserver.disconnect();
+      homeObserver = null;
+    }
+    const sentinel = document.getElementById('home-sentinel');
+    if (sentinel) sentinel.remove();
+    grid.innerHTML = renderSkeletons(12);
+  } else {
+    if (isLoadingMore) return;
+    isLoadingMore = true;
+    homePage++;
+    const sentinel = document.getElementById('home-sentinel');
+    if (sentinel) sentinel.remove(); // Remove sentinel, it'll be re-appended after new items
+    grid.insertAdjacentHTML('beforeend', renderSkeletons(4));
+  }
 
   try {
-    const data = await api.get('/api/home');
-    State.homeVideos = data.videos || [];
-    renderVideoGrid(grid, State.homeVideos);
-    Nav.set('content', 0);
+    const newVideos = loadMore 
+      ? (prefetchPromise ? await prefetchPromise : await fetchHomeVideos(homePage))
+      : await fetchHomeVideos(homePage);
+
+    if (loadMore) {
+      grid.querySelectorAll('.skel-card').forEach(e => e.remove());
+      State.homeVideos.push(...newVideos);
+      renderVideoGrid(grid, newVideos, true); // We'll update renderVideoGrid to support append
+    } else {
+      State.homeVideos = newVideos;
+      renderVideoGrid(grid, State.homeVideos, false);
+    }
+    
+    if (newVideos && newVideos.length > 0) {
+      // Add sentinel for IntersectionObserver
+      const sentinel = document.createElement('div');
+      sentinel.id = 'home-sentinel';
+      sentinel.style.gridColumn = '1 / -1';
+      sentinel.style.height = '10px';
+      grid.appendChild(sentinel);
+
+      if (homeObserver) homeObserver.disconnect();
+      homeObserver = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting && !isLoadingMore) {
+          loadHome(true);
+        }
+      }, { rootMargin: '400px' });
+      homeObserver.observe(sentinel);
+
+      // Start prefetching next page
+      prefetchPromise = fetchHomeVideos(homePage + 1);
+    }
+    
+    if (!loadMore) Nav.set('content', 0);
   } catch (err) {
-    grid.innerHTML = renderEmpty('⊞', 'Could not load subscriptions', err.message.slice(0, 100));
+    if (!loadMore) {
+      grid.innerHTML = renderEmpty('⊞', 'Could not load home', err.message.slice(0, 100));
+    }
+  } finally {
+    isLoadingMore = false;
   }
 }
 
@@ -376,7 +488,15 @@ function renderLibraryGrid(grid) {
       thumbnail: f.thumbnail,
       badge:     '<div class="card-badge badge-downloaded">▶ Play</div>',
     });
-    card.addEventListener('click', () => playFile(f));
+    card.addEventListener('click', () => {
+      const v = {
+        id: f.videoId,
+        title: f.title,
+        channel: f.channel,
+        thumbnail: f.thumbnail
+      };
+      openModal(v, true, false);
+    });
     grid.appendChild(card);
   });
   lazyLoadImages(grid);
@@ -401,7 +521,13 @@ function renderJobs() {
     return;
   }
 
-  list.innerHTML = State.jobs.map(job => {
+  // Remove empty state if present
+  if (list.querySelector('.empty-state')) {
+    list.innerHTML = '';
+  }
+
+  State.jobs.forEach(job => {
+    let item = $(`job-item-${job.id}`);
     const pct = job.progress || 0;
     const fillCls = job.status === 'done' ? 'success' : job.status === 'error' ? 'error' : '';
     const statusColor = {
@@ -413,8 +539,33 @@ function renderJobs() {
       ? `<img class="job-thumb" src="${esc(job.thumbnail)}" loading="lazy" alt="">`
       : `<div class="job-thumb-icon">▶</div>`;
 
-    return `
-      <div class="job-item">
+    const statusText = job.status === 'downloading' ? `${Math.round(pct)}%` : capitalize(job.status);
+    const metaHtml = `
+      ${job.speed ? `<span>${esc(job.speed)}</span>` : ''}
+      ${job.eta   ? `<span>ETA ${esc(job.eta)}</span>` : ''}
+    `;
+
+    if (item) {
+      // Update existing
+      const fill = item.querySelector('.job-progress-fill');
+      if (fill) {
+        fill.className = `job-progress-fill ${fillCls}`;
+        fill.style.width = `${pct}%`;
+      }
+      const meta = item.querySelector('.job-meta');
+      if (meta) meta.innerHTML = metaHtml;
+      
+      const status = item.querySelector('.job-status');
+      if (status) {
+        status.style.color = statusColor;
+        status.textContent = statusText;
+      }
+    } else {
+      // Create new
+      item = document.createElement('div');
+      item.className = 'job-item';
+      item.id = `job-item-${job.id}`;
+      item.innerHTML = `
         ${thumbEl}
         <div class="job-info">
           <div class="job-title">${esc(job.title)}</div>
@@ -422,15 +573,23 @@ function renderJobs() {
             <div class="job-progress-fill ${fillCls}" style="width:${pct}%"></div>
           </div>
           <div class="job-meta">
-            ${job.speed ? `<span>${esc(job.speed)}</span>` : ''}
-            ${job.eta   ? `<span>ETA ${esc(job.eta)}</span>` : ''}
+            ${metaHtml}
           </div>
         </div>
         <div class="job-status" style="color:${statusColor}">
-          ${job.status === 'downloading' ? `${Math.round(pct)}%` : capitalize(job.status)}
-        </div>
-      </div>`;
-  }).join('');
+          ${statusText}
+        </div>`;
+      list.appendChild(item);
+    }
+  });
+
+  // Remove stale items
+  const currentIds = State.jobs.map(j => `job-item-${j.id}`);
+  Array.from(list.children).forEach(child => {
+    if (child.id && child.id.startsWith('job-item-') && !currentIds.includes(child.id)) {
+      child.remove();
+    }
+  });
 }
 
 function startJobPolling() {
@@ -441,18 +600,20 @@ function startJobPolling() {
 // ─────────────────────────────────────────────────────────────────────────────
 // VIDEO GRID (home + search)
 // ─────────────────────────────────────────────────────────────────────────────
-function renderVideoGrid(grid, videos) {
-  if (!videos.length) {
+function renderVideoGrid(grid, videos, append = false) {
+  if (!videos.length && !append) {
     grid.innerHTML = renderEmpty('⊞', 'No videos found', '');
     return;
   }
-  grid.innerHTML = '';
+  if (!append) grid.innerHTML = '';
 
   // Build lookup sets for badge display
   const downloadedIds  = new Set(State.libraryFiles.map(f => f.videoId).filter(Boolean));
   const downloadingIds = new Set(
     State.jobs.filter(j => ['queued', 'downloading', 'processing'].includes(j.status)).map(j => j.videoId)
   );
+
+  const startIdx = append ? grid.querySelectorAll('.video-card').length : 0;
 
   videos.forEach((v, i) => {
     const isDownloaded  = downloadedIds.has(v.id);
@@ -463,7 +624,7 @@ function renderVideoGrid(grid, videos) {
     else if (isDownloading) badge = '<div class="card-badge badge-downloading">⬇ Downloading</div>';
 
     const card = makeCard({
-      idx:       i,
+      idx:       startIdx + i,
       title:     v.title,
       channel:   v.channel,
       thumbnail: v.thumbnail || `https://img.youtube.com/vi/${v.id}/mqdefault.jpg`,
@@ -519,31 +680,40 @@ function lazyLoadImages(container) {
 function openModal(video, isDownloaded, isDownloading) {
   State.selectedVideo = video;
 
-  $('modal-thumb').src       = video.thumbnail || `https://img.youtube.com/vi/${video.id}/mqdefault.jpg`;
+  $('modal-thumb').src            = video.thumbnail || `https://img.youtube.com/vi/${video.id}/mqdefault.jpg`;
   $('modal-title').textContent    = video.title;
   $('modal-channel').textContent  = video.channel || '';
   $('modal-duration').textContent = video.durationStr ? `Duration: ${video.durationStr}` : '';
 
+  const btnStream   = $('modal-btn-stream');
   const btnDownload = $('modal-btn-download');
   const btnPlay     = $('modal-btn-play');
+  const btnDelete   = $('modal-btn-delete');
+
+  // Stream button is hidden for now
+  btnStream.classList.add('hidden');
 
   if (isDownloaded) {
+    // Already downloaded — show Play + Delete (local), hide Download
     btnDownload.classList.add('hidden');
     btnPlay.classList.remove('hidden');
-    Nav.set('modal', 0); // play is idx=1 but download is hidden so play becomes first visible
+    if (btnDelete) btnDelete.classList.remove('hidden');
   } else if (isDownloading) {
     btnDownload.textContent = '⬇ Downloading…';
     btnDownload.disabled    = true;
+    btnDownload.classList.remove('hidden');
     btnPlay.classList.add('hidden');
-    Nav.set('modal', 0);
+    if (btnDelete) btnDelete.classList.add('hidden');
   } else {
     btnDownload.textContent = '⬇ Download';
     btnDownload.disabled    = false;
+    btnDownload.classList.remove('hidden');
     btnPlay.classList.add('hidden');
-    Nav.set('modal', 0);
+    if (btnDelete) btnDelete.classList.add('hidden');
   }
 
   $('modal-video').classList.remove('hidden');
+  Nav.set('modal', 0);
 }
 
 function closeModal() {
@@ -570,6 +740,84 @@ async function downloadSelected() {
     showToast('Download failed: ' + err.message.slice(0, 60));
   }
 }
+
+/**
+ * Stream a YouTube video directly (ad-free) via the server proxy.
+ * The server calls yt-dlp --get-url to extract the raw CDN URL,
+ * then pipes the bytes — so no ads, no YouTube player involved.
+ */
+async function streamVideo() {
+  const v = State.selectedVideo;
+  if (!v) return;
+
+  closeModal();
+
+  // Show the player immediately with a loading indicator
+  const video = $('video-player');
+  $('player-title-text').textContent = v.title;
+  showScreen('player');
+  Nav.set('player', 1);
+  showPlayerUI();
+
+  showToast('⏳ Fetching stream… (1–3 sec)');
+
+  // Point the <video> src directly at our proxy endpoint.
+  // The server calls yt-dlp --print urls --skip-download, extracts a progressive
+  // CDN URL and pipes bytes back. No YouTube player = no ads.
+  const streamSrc = `${SERVER}/api/stream-yt/${encodeURIComponent(v.id)}`;
+  video.src = streamSrc;
+  video.load();
+
+  // Listen for errors so we can show a useful message instead of black screen
+  video.onerror = async () => {
+    let detail = 'Could not load stream';
+    try {
+      // Try to fetch the error body from the server (the endpoint sends JSON on failure)
+      const r = await fetch(streamSrc, { method: 'HEAD' });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        detail = body.error || body.detail || `HTTP ${r.status}`;
+      }
+    } catch { /* ignore */ }
+    showToast(`⚠ Stream failed: ${detail}. Check Logs for details.`);
+    closePlayer();
+  };
+
+  video.play().catch(() => {});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOGS
+// ─────────────────────────────────────────────────────────────────────────────
+function escapeHTML(str) {
+  if (!str) return '';
+  return str.replace(/[&<>'"]/g, 
+    tag => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[tag])
+  );
+}
+
+async function loadLogs() {
+  const c = $('logs-list');
+  c.innerHTML = '<div class="spinner"></div>';
+  try {
+    const logs = await api.get('/api/logs');
+    if (!logs.length) {
+      c.innerHTML = '<div class="empty-state">No logs available.</div>';
+      Nav.set('sidebar', Nav.sidebarIdx());
+      return;
+    }
+    c.innerHTML = logs.map(l => `<div class="log-line">${escapeHTML(l)}</div>`).join('');
+    // Auto scroll to bottom
+    c.scrollTop = c.scrollHeight;
+    Nav.set('sidebar', Nav.sidebarIdx());
+  } catch (err) {
+    c.innerHTML = `<div class="error-msg">${escapeHTML(err.message)}</div>`;
+    Nav.set('sidebar', Nav.sidebarIdx());
+  }
+}
+
+$('btn-refresh-logs').onclick = loadLogs;
+$('btn-clear-logs').onclick = () => { $('logs-list').innerHTML = ''; };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PLAYER
@@ -718,7 +966,27 @@ async function init() {
   });
 
   // ── Modal ──
+  $('modal-btn-stream').addEventListener('click',   streamVideo);
   $('modal-btn-download').addEventListener('click', downloadSelected);
+  $('modal-btn-delete').addEventListener('click', async () => {
+    const v = State.selectedVideo;
+    if (!v) return;
+    const file = State.libraryFiles.find(f => f.videoId === v.id);
+    if (file) {
+      try {
+        await api.delete(`/api/library/${encodeURIComponent(file.filename)}`);
+        showToast('Video deleted');
+        closeModal();
+        await loadLibrary();
+        if (State.section === 'home') await loadHome();
+        if (State.section === 'search') await doSearch();
+      } catch (e) {
+        showToast('Failed to delete video');
+      }
+    } else {
+      showToast('File not found in library');
+    }
+  });
   $('modal-btn-close').addEventListener('click',    closeModal);
   $('modal-backdrop').addEventListener('click',     closeModal);
   $('modal-btn-play').addEventListener('click', () => {
@@ -742,7 +1010,6 @@ async function init() {
     if (status.status === 'authenticated') {
       transitionToMain(status);
     } else if (status.status === 'checking') {
-      // Server is still doing the initial cookie check — poll until done
       msgEl.textContent = 'Checking Chrome cookies…';
       const poll = setInterval(async () => {
         try {
@@ -767,6 +1034,27 @@ async function init() {
     showToast('⚠ Cannot reach server at ' + SERVER);
     Nav.set('login', 0);
   }
+
+  // Poll auth status every 5 seconds — once authenticated, update the avatar without full reload
+  setInterval(async () => {
+    try {
+      const s = await api.get('/api/auth/status');
+      if (s.status === 'authenticated' && s.avatarUrl && State.screen === 'main') {
+        const avatarEl = $('sidebar-user-avatar');
+        const nameEl   = $('sidebar-user-name');
+        const userBtn  = $('sidebar-user-btn');
+        const logoEl   = document.querySelector('.sidebar-logo');
+
+        if (logoEl) logoEl.style.display = 'none';
+        if (avatarEl && avatarEl.src !== s.avatarUrl) {
+          avatarEl.src = s.avatarUrl;
+          avatarEl.style.display = 'block';
+        }
+        if (nameEl && s.displayName) nameEl.textContent = s.displayName;
+        if (userBtn) userBtn.style.display = 'flex';
+      }
+    } catch { /* ignore */ }
+  }, 5000);
 }
 
 document.addEventListener('DOMContentLoaded', init);

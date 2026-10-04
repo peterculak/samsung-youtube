@@ -4,11 +4,51 @@ const express   = require('express');
 const cors      = require('cors');
 const path      = require('path');
 const fs        = require('fs');
+const http      = require('http');
+const https     = require('https');
 const { spawn } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
+const os        = require('os');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+// ─── Auto-update config.js with current local IP ─────────────────────────────
+function getLocalIp() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return 'localhost';
+}
+
+const localIp = getLocalIp();
+const configJsPath = path.join(__dirname, '../js/config.js');
+if (fs.existsSync(configJsPath)) {
+  let content = fs.readFileSync(configJsPath, 'utf8');
+  content = content.replace(
+    /SERVER_URL:\s*.*?,/g,
+    `SERVER_URL: (typeof window !== 'undefined' && window.location.protocol.startsWith('http')) ? '' : 'http://${localIp}:${PORT}',`
+  );
+  fs.writeFileSync(configJsPath, content, 'utf8');
+  console.log(`[config] Auto-updated config.js with local IP: ${localIp}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory log ring buffer — last 200 lines, readable from /api/logs
+// ─────────────────────────────────────────────────────────────────────────────
+const LOG_RING = [];
+const LOG_MAX  = 200;
+function log(tag, msg) {
+  const entry = `[${new Date().toISOString()}] [${tag}] ${msg}`;
+  console.log(entry);
+  LOG_RING.push(entry);
+  if (LOG_RING.length > LOG_MAX) LOG_RING.shift();
+}
 
 // Which browser to pull cookies from. Override with env var: BROWSER=firefox node server.js
 // Supported values: chrome, chromium, brave, edge, vivaldi, opera, firefox, safari
@@ -17,6 +57,18 @@ const BROWSER = process.env.BROWSER || 'chrome';
 // Directory where downloaded videos are stored
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR
   || path.resolve(__dirname, '../../../../ta3-cli/downloads/youtube');
+
+// Background cache refresh interval (default 30 min). Override with CACHE_REFRESH_MS env var.
+const CACHE_REFRESH_MS = parseInt(process.env.CACHE_REFRESH_MS) || 30 * 60 * 1000;
+
+// Number of pages to pre-cache per topic
+const CACHE_PAGES = 10;
+
+// Max concurrent yt-dlp processes during cache warm. Override with CACHE_CONCURRENCY env var.
+const CACHE_CONCURRENCY = parseInt(process.env.CACHE_CONCURRENCY) || 4;
+
+// Topics to cache (chip categories + home)
+const CHIP_TOPICS = ['Music', 'Gaming', 'News', 'Comedy', 'Podcasts', 'Programming'];
 
 app.use(cors());
 app.use(express.json());
@@ -28,10 +80,28 @@ app.use(express.static(path.join(__dirname, '..')));
 // No device code needed. Just log into YouTube in Chrome (or BROWSER) on this Mac.
 // ─────────────────────────────────────────────────────────────────────────────
 
+const COOKIES_FILE = path.join(__dirname, 'data', 'cookies.txt');
+
+function ensureCookiesFile() {
+  if (!fs.existsSync(COOKIES_FILE)) {
+    console.log(`[auth] Exporting cookies from ${BROWSER} to ${COOKIES_FILE}... (this takes a few seconds)`);
+    require('child_process').spawnSync('yt-dlp', [
+      '--cookies-from-browser', BROWSER,
+      '--cookies', COOKIES_FILE,
+      '--skip-download', '--no-warnings', '--quiet', '--playlist-items', '0',
+      'https://www.youtube.com/'
+    ]);
+    console.log(`[auth] Export complete.`);
+  }
+}
+
 let authState = {
   status:  'checking', // checking | authenticated | unauthenticated | error
   browser: BROWSER,
   message: '',
+  userId:  null,
+  displayName: null,
+  avatarUrl: null,
 };
 
 /**
@@ -40,42 +110,147 @@ let authState = {
  */
 function cookieArgs() {
   return authState.status === 'authenticated'
-    ? ['--cookies-from-browser', BROWSER]
+    ? ['--cookies', COOKIES_FILE]
     : [];
 }
 
 /**
- * Runs a quick yt-dlp --simulate to check if browser cookies give us YouTube access.
- * Resolves to true if authenticated, false otherwise.
+ * Derive a stable userId from the current browser session.
+ * We run yt-dlp on a known YouTube URL that returns the uploader/channel
+ * of the logged-in user. Falls back to 'authenticated_user' / null.
+ *
+ * Strategy:
+ *   1. yt-dlp --print %(channel)s on https://www.youtube.com/@me
+ *      → redirects to the logged-in user's channel, always returns real name
+ *   2. Innertube (youtubei.js) account API for avatar URL (non-fatal fallback)
  */
-function checkAuth() {
-  return new Promise((resolve) => {
-    const proc = spawn('yt-dlp', [
-      '--cookies-from-browser', BROWSER,
-      '--simulate', '--quiet', '--no-warnings',
-      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+async function detectUserId() {
+  let userId = 'authenticated_user';
+  let displayName = null;
+  let avatarUrl = null;
+
+  // ── Approach 1: yt-dlp @me — gets real channel name reliably ──────────────
+  try {
+    displayName = await new Promise((resolve, reject) => {
+      let out = '';
+      const p = spawn('yt-dlp', [
+        '--cookies', COOKIES_FILE,
+        '--no-warnings', '--quiet', '--skip-download',
+        '--playlist-items', '0',
+        '--print', '%(channel)s',
+        'https://www.youtube.com/@me',
+      ]);
+      p.stdout.on('data', d => { out += d; });
+      p.on('close', (code) => {
+        const name = out.trim();
+        if (name && name !== 'NA' && name !== 'None' && name !== 'none') {
+          resolve(name);
+        } else {
+          reject(new Error(`No channel name (exit ${code}, got: "${name}")`));
+        }
+      });
+      p.on('error', reject);
+      setTimeout(() => { p.kill(); reject(new Error('yt-dlp @me timeout')); }, 15000);
+    });
+    log('auth', `Real channel name: "${displayName}"`);
+  } catch (e) {
+    log('auth', `[WARN] yt-dlp @me name failed: ${e.message.slice(0, 120)}`);
+  }
+
+  // ── Approach 2: Innertube (youtubei.js) — for avatar URL only ─────────────
+  try {
+    const tmpFile = path.join(__dirname, `data/yt_avatar_cookies_${Date.now()}.txt`);
+    await new Promise((res2) => {
+      const p = spawn('yt-dlp', [
+        '--cookies-from-browser', BROWSER,
+        '--cookies', tmpFile,
+        '--skip-download', '--no-warnings', '--quiet', '--playlist-items', '0',
+        'https://www.youtube.com/',
+      ]);
+      p.on('close', res2);
+      p.on('error', res2);
+      setTimeout(() => { p.kill(); res2(); }, 20000);
+    });
+
+    const cookies = parseCookiesFromFile(tmpFile);
+    try { fs.existsSync(tmpFile) && fs.unlinkSync(tmpFile); } catch (_) {}
+
+    if (cookies.length > 0) {
+      const { Innertube, Platform } = await import('youtubei.js');
+      const { default: vm } = await import('node:vm');
+      Platform.shim.eval = (data) => {
+        const ctx = vm.createContext({ globalThis: {}, window: {}, document: {}, console, setTimeout, clearTimeout, URL, URLSearchParams });
+        ctx.globalThis = ctx;
+        return new vm.Script(`(function() { ${data.output} })()`).runInContext(ctx);
+      };
+      const yt = await Innertube.create({ retrieve_player: false, cookie: cookies });
+      const info = await yt.account.getInfo();
+      const acc = info?.contents?.contents?.[0];
+      avatarUrl = acc?.account_photo?.[0]?.url || null;
+      // Only use Innertube name if yt-dlp failed
+      if (!displayName) {
+        const inName = acc?.account_name?.text || null;
+        if (inName) displayName = inName;
+      }
+    }
+  } catch (e) {
+    log('auth', `Innertube avatar fetch failed (non-fatal): ${e.message.slice(0, 80)}`);
+  }
+
+  return { userId, displayName, avatarUrl };
+}
+
+/**
+ * Checks if browser cookies give us authenticated YouTube access.
+ * Uses ytdlpJson() directly — the exact same code path as real home feed fetches.
+ * If fetching one video from the homepage works, auth is confirmed.
+ */
+async function checkAuth(forceLiveCheck = false) {
+  try {
+    if (!forceLiveCheck && fs.existsSync(COOKIES_FILE)) {
+      return true; // Fast path for instant server boot
+    }
+    
+    ensureCookiesFile();
+    const videos = await ytdlpJson([
+      '--cookies', COOKIES_FILE,
+      '--flat-playlist', '--no-warnings',
+      '--playlist-items', '1',
+      'https://www.youtube.com/',
     ]);
-    let errOut = '';
-    proc.stderr.on('data', d => { errOut += d.toString(); });
-    proc.on('close', code => resolve(code === 0));
-    proc.on('error', () => resolve(false));
-    // Timeout after 20 s
-    setTimeout(() => { proc.kill(); resolve(false); }, 20000);
-  });
+    return videos.length > 0;
+  } catch (err) {
+    log('auth', `checkAuth failed: ${err.message.slice(0, 120)}`);
+    return false;
+  }
 }
 
 // Run auth check on startup
 (async () => {
   console.log(`[auth] Checking ${BROWSER} cookies…`);
-  const ok = await checkAuth();
+  const ok = await checkAuth(false);
   if (ok) {
-    authState.status  = 'authenticated';
-    authState.message = `Using ${BROWSER} cookies`;
+    authState.status      = 'authenticated';
+    authState.message     = `Using ${BROWSER} cookies`;
+    authState.userId      = 'authenticated_user'; // overwritten by detectUserId() below
+    authState.displayName = '…';                  // placeholder — never null when authed
     console.log(`[auth] ✓ Authenticated via ${BROWSER}`);
+    // Detect real channel name + avatar in background (non-blocking)
+    detectUserId().then(({ userId, displayName, avatarUrl }) => {
+      authState.userId      = userId;
+      authState.displayName = displayName;   // null only if ALL detection methods failed
+      authState.avatarUrl   = avatarUrl;
+      log('auth', `User: ${displayName ?? '(unknown)'} (${userId}) avatar: ${avatarUrl ? 'yes' : 'no'}`);
+      scheduleWarmCache(userId);
+    });
   } else {
     authState.status  = 'unauthenticated';
+    authState.userId  = 'anonymous';
     authState.message = `Log into YouTube in ${BROWSER} on this Mac, then click Verify`;
-    console.log(`[auth] ✗ Not authenticated — log into YouTube in ${BROWSER}`);
+    console.log(`[auth] ✗ Not authenticated — no cache warming until user logs in`);
+    // ⚠️  Do NOT warm cache for anonymous users — there is no personalised content
+    //     and running 70 yt-dlp processes wastes resources and spams the log.
+    //     Cache warming starts only after a successful /api/auth/verify.
   }
 })();
 
@@ -85,61 +260,392 @@ app.get('/api/auth/status', (_req, res) => res.json(authState));
 // POST /api/auth/verify — re-runs the cookie check
 app.post('/api/auth/verify', async (_req, res) => {
   authState.status = 'checking';
-  const ok = await checkAuth();
-  authState.status  = ok ? 'authenticated' : 'unauthenticated';
-  authState.message = ok
-    ? `Using ${BROWSER} cookies`
-    : `Log into YouTube in ${BROWSER} on this Mac, then click Verify`;
+  const ok = await checkAuth(true); // Force live check
+  if (ok) {
+    authState.status      = 'authenticated';
+    authState.message     = `Using ${BROWSER} cookies`;
+    authState.displayName = '…'; // placeholder while detectUserId runs
+    res.json(authState);          // respond immediately — don't block on name detection
+
+    // Detect real channel name + avatar (runs after response is sent)
+    detectUserId().then(({ userId, displayName, avatarUrl }) => {
+      authState.userId      = userId;
+      authState.displayName = displayName;
+      authState.avatarUrl   = avatarUrl;
+      log('auth', `Verified: ${displayName ?? '(unknown)'} (${userId}) avatar: ${avatarUrl ? 'yes' : 'no'}`);
+      scheduleWarmCache(userId);
+    }).catch(err => log('auth', `detectUserId error: ${err.message}`));
+
+    return; // already responded
+  } else {
+    authState.status      = 'unauthenticated';
+    authState.userId      = 'anonymous';
+    authState.displayName = null;
+    authState.message     = `Log into YouTube in ${BROWSER} on this Mac, then click Verify`;
+  }
   res.json(authState);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Home Feed
+// Per-User Content Cache
+//
+// Structure:
+//   contentCache[userId][topic][page] = {
+//     videos:    [...],
+//     fetchedAt: <timestamp ms>,
+//     ready:     true,
+//   }
+//
+// 'topic' is either 'home' or a chip label like 'Music', 'Gaming', etc.
+// userId is derived from the YouTube account handle (or 'anonymous').
+// Cache is NEVER evicted on logout — switching users re-uses the existing cache.
 // ─────────────────────────────────────────────────────────────────────────────
 
-let homeCache   = null;
-let homeCacheTs = 0;
-const HOME_TTL  = 10 * 60 * 1000; // 10 minutes
+const CACHE_FILE = path.join(__dirname, 'data', 'cache.json');
+let contentCache = {};        // userId → topic → page → entry
 
-app.get('/api/home', async (_req, res) => {
-  const now = Date.now();
-  if (homeCache && now - homeCacheTs < HOME_TTL) return res.json(homeCache);
+try {
+  if (fs.existsSync(CACHE_FILE)) {
+    contentCache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+  }
+} catch (e) {
+  console.log(`[cache] Failed to load cache from disk: ${e.message}`);
+}
 
+let cacheSaveTimer = null;
+function saveCache() {
+  if (cacheSaveTimer) clearTimeout(cacheSaveTimer);
+  cacheSaveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(CACHE_FILE, JSON.stringify(contentCache));
+    } catch (e) {
+      console.log(`[cache] Failed to save cache to disk: ${e.message}`);
+    }
+  }, 2000);
+}
+
+const warmingLock  = {};        // userId → boolean (prevents concurrent warm runs)
+const refreshTimers = {};       // userId → timer handle
+
+function getUserCache(userId) {
+  if (!contentCache[userId]) {
+    contentCache[userId] = {};
+  }
+  return contentCache[userId];
+}
+
+function getCacheEntry(userId, topic, page) {
+  const uc = getUserCache(userId);
+  if (!uc[topic]) uc[topic] = {};
+  return uc[topic][page] || null;
+}
+
+function setCacheEntry(userId, topic, page, videos) {
+  const uc = getUserCache(userId);
+  if (!uc[topic]) uc[topic] = {};
+  uc[topic][page] = { videos, fetchedAt: Date.now(), ready: true };
+  saveCache();
+}
+
+/**
+ * Fetch videos for a given topic+page using yt-dlp.
+ * Always uses cookies — userId is only used as a cache key, not an auth gate.
+ * Home always uses https://www.youtube.com/ (works for both authed + unauthed;
+ * the trending URL is broken in recent yt-dlp versions).
+ */
+async function fetchVideosForTopic(userId, topic, page) {
+  const pageSize = 24;
+  const start = (page - 1) * pageSize + 1;
+  const end   = page * pageSize;
+
+  // Always try cookies — if the user is logged in, content is personalised;
+  // if not, YouTube just ignores the cookies and returns generic content.
+  ensureCookiesFile();
+  const cookies = ['--cookies', COOKIES_FILE];
+
+  if (topic === 'home') {
+    // yt-dlp flat-playlist extraction of youtube.com is currently hanging or unstable.
+    // Use youtubei.js to reliably fetch the user's personalised home feed!
+    try {
+      const yt = await getYoutubeiClient();
+      if (!yt) throw new Error('Could not init youtubei.js');
+      const home = await yt.getHomeFeed();
+      const videos = [];
+      const vids = home?.videos || [];
+      for (const v of vids) {
+        if (videos.length >= end) break;
+        if (v.type !== 'Video' && v.type !== 'CompactVideo') continue;
+        const thumb = v.thumbnails?.[0]?.url || `https://img.youtube.com/vi/${v.id}/mqdefault.jpg`;
+        videos.push({
+          id:          v.id,
+          title:       v.title?.text || v.title || v.id,
+          thumbnail:   thumb,
+          duration:    v.duration?.seconds || 0,
+          durationStr: formatDuration(v.duration?.seconds || 0),
+          channel:     v.author?.name || '',
+          viewCount:   v.view_count?.text || 0,
+          uploadDate:  v.published?.text || '',
+        });
+      }
+      return videos.slice(start - 1, end);
+    } catch (err) {
+      log('cache', `youtubei.js home fetch failed: ${err.message}. Falling back to search.`);
+      return ytdlpJson([
+        ...cookies,
+        '--flat-playlist', '--no-warnings',
+        '--playlist-start', String(start),
+        '--playlist-end',   String(end),
+        'ytsearchall:popular videos',
+      ]);
+    }
+  } else {
+    return ytdlpJson([
+      ...cookies,
+      '--flat-playlist', '--no-warnings',
+      '--playlist-start', String(start),
+      '--playlist-end',   String(end),
+      `ytsearchall:${topic}`,
+    ]);
+  }
+}
+
+/**
+ * Priority-ordered cache warming:
+ *   Phase 1 — home p1 (fetched first, blocks until done so UI has content immediately)
+ *   Phase 2 — all topic p1 pages in parallel (so every tab has content)
+ *   Phase 3 — remaining pages 2-N for all topics (background depth fill)
+ *
+ * Already-fresh entries (< CACHE_REFRESH_MS) are skipped.
+ */
+async function warmCachePriority(userId) {
+  if (warmingLock[userId]) {
+    log('cache', `[${userId}] Warm already in progress — skipping`);
+    return;
+  }
+  warmingLock[userId] = true;
+
+  const topics = ['home', ...CHIP_TOPICS];
+  const t0 = Date.now();
+
+  function isStale(userId, topic, page) {
+    const entry = getCacheEntry(userId, topic, page);
+    return !entry || (Date.now() - entry.fetchedAt) >= CACHE_REFRESH_MS;
+  }
+
+  async function fetchAndCache(topic, page) {
+    try {
+      const videos = await fetchVideosForTopic(userId, topic, page);
+      setCacheEntry(userId, topic, page, videos);
+      log('cache', `[${userId}] ✓ ${topic} p${page} — ${videos.length} videos`);
+    } catch (err) {
+      log('cache', `[${userId}] ✗ ${topic} p${page} — ${err.message.slice(0, 80)}`);
+    }
+  }
+
+  // ── Phase 1: home page 1 (highest priority — needed for immediate UI render) ──
+  if (isStale(userId, 'home', 1)) {
+    log('cache', `[${userId}] Phase 1: fetching home p1 (priority)`);
+    await fetchAndCache('home', 1);
+  } else {
+    log('cache', `[${userId}] Phase 1: home p1 already fresh — skipping`);
+  }
+
+  // ── Phase 2: all topic p1 pages in parallel (so every tab has content fast) ──
+  const phase2 = topics.filter(t => t !== 'home' && isStale(userId, t, 1));
+  if (phase2.length > 0) {
+    log('cache', `[${userId}] Phase 2: fetching p1 for ${phase2.length} topics in parallel`);
+    await Promise.allSettled(phase2.map(topic => fetchAndCache(topic, 1)));
+  }
+
+  // ── Phase 3: remaining pages (pages 2-N for all topics) ──
+  const queue = [];
+  for (const topic of topics) {
+    for (let page = (topic === 'home' ? 2 : 2); page <= CACHE_PAGES; page++) {
+      if (isStale(userId, topic, page)) queue.push({ topic, page });
+    }
+  }
+
+  if (queue.length > 0) {
+    log('cache', `[${userId}] Phase 3: warming ${queue.length} remaining pages (concurrency=${CACHE_CONCURRENCY})`);
+    let idx = 0;
+    async function worker() {
+      while (true) {
+        const item = queue[idx++];
+        if (!item) break;
+        await fetchAndCache(item.topic, item.page);
+      }
+    }
+    await Promise.allSettled(
+      Array.from({ length: Math.min(CACHE_CONCURRENCY, queue.length) }, worker)
+    );
+  }
+
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  log('cache', `[${userId}] Cache warm complete in ${elapsed}s`);
+  warmingLock[userId] = false;
+}
+
+/**
+ * Schedule periodic cache refresh for a user.
+ * On first call, immediately starts priority warming; subsequent runs repeat every CACHE_REFRESH_MS.
+ */
+function scheduleWarmCache(userId) {
+  // Avoid duplicate timers for the same user
+  if (refreshTimers[userId]) return;
+
+  // Warm immediately using priority order (non-blocking)
+  warmCachePriority(userId).catch(err => log('cache', `[${userId}] Warm error: ${err.message}`));
+
+  // Then refresh on a schedule
+  refreshTimers[userId] = setInterval(() => {
+    log('cache', `[${userId}] Scheduled refresh triggered`);
+    warmCachePriority(userId).catch(err => log('cache', `[${userId}] Refresh error: ${err.message}`));
+  }, CACHE_REFRESH_MS);
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache Status endpoint — useful for debugging
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/cache/status', (_req, res) => {
+  const summary = {};
+  for (const [userId, topicMap] of Object.entries(contentCache)) {
+    summary[userId] = {};
+    for (const [topic, pages] of Object.entries(topicMap)) {
+      summary[userId][topic] = {
+        pagesReady: Object.values(pages).filter(e => e.ready).length,
+        pages: Object.fromEntries(
+          Object.entries(pages).map(([page, e]) => [
+            page,
+            {
+              ready:     e.ready,
+              count:     e.videos?.length ?? 0,
+              fetchedAt: e.fetchedAt ? new Date(e.fetchedAt).toISOString() : null,
+              ageMs:     e.fetchedAt ? Date.now() - e.fetchedAt : null,
+            }
+          ])
+        )
+      };
+    }
+  }
+  res.json({
+    currentUserId:  authState.userId,
+    refreshIntervalMs: CACHE_REFRESH_MS,
+    cachePages: CACHE_PAGES,
+    warmingNow: Object.entries(warmingLock)
+      .filter(([, v]) => v)
+      .map(([k]) => k),
+    users: summary,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Home Feed — served from cache; falls back to live fetch on cache miss
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/home', async (req, res) => {
+  const page   = parseInt(req.query.page) || 1;
+  const userId = authState.userId || 'anonymous';
+
+  // Serve from cache if available
+  const cached = getCacheEntry(userId, 'home', page);
+  if (cached?.ready) {
+    return res.json({
+      videos:   cached.videos,
+      source:   authState.status === 'authenticated' ? 'homepage' : 'trending',
+      page,
+      cached:   true,
+      cachedAt: cached.fetchedAt,
+    });
+  }
+
+  // Cache miss — fetch live and populate cache
+  log('cache', `[${userId}] home p${page} cache miss — fetching live`);
   try {
-    // If authenticated: show personal subscription feed
-    // If not: show YouTube trending (no login needed)
-    const url = authState.status === 'authenticated'
-      ? 'https://www.youtube.com/feed/subscriptions'
-      : 'https://www.youtube.com/feed/trending';
-
-    const args = [
-      ...cookieArgs(),
-      '--flat-playlist', '--no-warnings', '--playlist-end', '24',
-    ];
-
-    const videos = await ytdlpJson([...args, url]);
-    homeCache   = { videos, source: authState.status === 'authenticated' ? 'subscriptions' : 'trending' };
-    homeCacheTs = now;
-    res.json(homeCache);
+    const videos = await fetchVideosForTopic(userId, 'home', page);
+    setCacheEntry(userId, 'home', page, videos);
+    res.json({
+      videos,
+      source:  authState.status === 'authenticated' ? 'homepage' : 'trending',
+      page,
+      cached:  false,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Search
+// Chip Categories — served from cache; falls back to live fetch on cache miss
+// Client should use this endpoint for chip tabs (Music, Gaming, etc.)
+// NOT for user-typed search (use /api/search for that).
 // ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/chips', async (req, res) => {
+  const topic  = (req.query.topic || '').trim();
+  const page   = parseInt(req.query.page) || 1;
+  const userId = authState.userId || 'anonymous';
+
+  if (!topic) return res.status(400).json({ error: 'topic is required' });
+
+  // Serve from cache if available
+  const cached = getCacheEntry(userId, topic, page);
+  if (cached?.ready) {
+    return res.json({
+      videos:   cached.videos,
+      topic,
+      page,
+      cached:   true,
+      cachedAt: cached.fetchedAt,
+    });
+  }
+
+  // Cache miss — fetch live
+  log('cache', `[${userId}] chips/${topic} p${page} cache miss — fetching live`);
+  try {
+    const videos = await fetchVideosForTopic(userId, topic, page);
+    setCacheEntry(userId, topic, page, videos);
+    res.json({ videos, topic, page, cached: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Search — always live, no persistent cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+let searchCache   = {};
+let searchCacheTs = {};
+const SEARCH_TTL  = 10 * 60 * 1000; // 10 min short TTL for search dedup
 
 app.get('/api/search', async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q is required' });
 
+  const page     = parseInt(req.query.page) || 1;
+  const pageSize = 24;
+  const start    = (page - 1) * pageSize + 1;
+  const end      = page * pageSize;
+
+  const cacheKey = `${q}_${page}`;
+  const now      = Date.now();
+  if (searchCache[cacheKey] && now - (searchCacheTs[cacheKey] || 0) < SEARCH_TTL) {
+    return res.json({ videos: searchCache[cacheKey], cached: true });
+  }
+
   try {
     const videos = await ytdlpJson([
+      ...cookieArgs(),
       '--flat-playlist', '--no-warnings',
-      `ytsearch20:${q}`,
+      '--playlist-start', String(start),
+      '--playlist-end',   String(end),
+      `ytsearchall:${q}`,
     ]);
-    res.json({ videos });
+    searchCache[cacheKey]   = videos;
+    searchCacheTs[cacheKey] = now;
+    res.json({ videos, cached: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -191,16 +697,20 @@ app.get('/api/jobs/:id', (req,  res) => {
 
 function startDownload(job) {
   job.status = 'downloading';
+  job.logs   = [];
 
+  // Use the exact yt-dlp arguments that work reliably in the CLI
   const args = [
-    ...cookieArgs(),
-    '--extractor-args', 'youtube:player_client=default,ios',
-    '-f', 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
-    '--merge-output-format', 'mp4',
+    // ...cookieArgs(), // Disabled: cookies often trigger 403 Forbidden throttling on YouTube
+    '-f', 'bestvideo+bestaudio/best',
+    '--merge-output-format', 'mkv',
     '--no-warnings', '--newline',
     '-o', path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
     `https://www.youtube.com/watch?v=${job.videoId}`,
   ];
+
+  log('download', `Starting: ${job.videoId} "${job.title}"`);
+  log('download', `Command: yt-dlp ${args.join(' ')}`);
 
   const proc = spawn('yt-dlp', args);
   let buf = '';
@@ -211,15 +721,47 @@ function startDownload(job) {
     buf = lines.pop();
 
     for (const line of lines) {
-      console.log('[yt-dlp]', line);
+      if (!line.trim()) continue;
+      // Filter out known benign noise to keep logs readable
+      const isNoise = /NotOpenSSLWarning|urllib3 v2|LibreSSL|Deprecated Feature.*Python/i.test(line);
+      if (!isNoise) log('yt-dlp', line);
+      job.logs.push(line);
+      if (job.logs.length > 200) job.logs.shift();
 
-      const pm = line.match(/\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\w+\/s).*?ETA\s+([\d:]+)/i);
-      if (pm) { job.progress = parseFloat(pm[1]); job.speed = pm[2]; job.eta = pm[3]; }
+      const pm = line.match(/\[download\]\s+([\d.]+)%/i);
+      if (pm) { 
+        job.progress = parseFloat(pm[1]); 
+        const speedMatch = line.match(/at\s+([~\d.]+\s*[a-zA-Z]+\/s|Unknown\s*B\/s)/i);
+        const etaMatch = line.match(/ETA\s+([\d:]+|Unknown)/i);
+        if (speedMatch) job.speed = speedMatch[1].trim();
+        if (etaMatch) job.eta = etaMatch[1].trim();
+      }
 
-      const dm = line.match(/Destination:\s+(.+\.mp4)/i);
-      if (dm) job.filePath = dm[1].trim();
+      // yt-dlp might download video and audio separately, capture the final merged output
+      const mergeMatch = line.match(/Merging formats into "(.+?)"/i);
+      if (mergeMatch) {
+        job.filePath = mergeMatch[1].trim();
+        job.status = 'processing'; 
+        job.progress = 99;
+      } else {
+        // Fallback for single-file downloads
+        const dm = line.match(/Destination:\s+(.+?\.(?:mp4|mkv|webm|m4a))/i);
+        if (dm && !job.filePath) {
+          job.filePath = dm[1].trim();
+        }
+      }
 
-      if (/Merging formats/i.test(line)) { job.status = 'processing'; job.progress = 99; }
+      // Capture meaningful error lines — keep ALL of them, not just last
+      const errMatch = line.match(/ERROR:\s+(.+)/i);
+      if (errMatch) {
+        job._lastError = errMatch[1].trim();
+        log('download', `[ERROR captured] ${job._lastError}`);
+      }
+
+      // Warn specifically on 403 so it's easy to spot
+      if (/HTTP Error 403/i.test(line)) {
+        log('download', `[403 THROTTLE] Video ${job.videoId} — YouTube is throttling this format. Consider using Stream instead.`);
+      }
     }
   };
 
@@ -229,8 +771,10 @@ function startDownload(job) {
   proc.on('close', (code) => {
     if (code === 0) {
       job.status = 'done'; job.progress = 100; job.speed = ''; job.eta = '';
+      log('download', `Done: ${job.videoId}`);
       if (job.filePath && fs.existsSync(job.filePath)) {
-        const metaPath = job.filePath.replace(/\.mp4$/i, '.json');
+        // Replace whatever extension we ended up with (.mkv, .webm, .mp4) with .json
+        const metaPath = job.filePath.replace(/\.[^.]+$/, '.json');
         try {
           fs.writeFileSync(metaPath, JSON.stringify({
             videoId: job.videoId, title: job.title,
@@ -241,12 +785,24 @@ function startDownload(job) {
       }
     } else {
       job.status = 'error';
-      job.error  = `yt-dlp exited with code ${code}`;
+      job.error = job._lastError || `yt-dlp exited with code ${code}`;
+      log('download', `FAILED: ${job.videoId} — ${job.error}`);
+      log('download', `Last 5 log lines for ${job.videoId}:`);
+      job.logs.slice(-5).forEach(l => log('download', `  | ${l}`));
     }
   });
 
-  proc.on('error', (err) => { job.status = 'error'; job.error = err.message; });
+  proc.on('error', (err) => {
+    job.status = 'error';
+    job.error  = err.message;
+    log('download', `SPAWN ERROR: ${err.message}`);
+  });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Logs endpoint — returns last N server log lines
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/logs', (_req, res) => res.json(LOG_RING));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Library
@@ -278,8 +834,24 @@ app.get('/api/library', (_req, res) => {
   res.json(files);
 });
 
+app.delete('/api/library/:filename', (req, res) => {
+  const filePath = path.join(DOWNLOAD_DIR, path.basename(req.params.filename));
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
+
+  try {
+    fs.unlinkSync(filePath);
+    const metaPath = filePath.replace(/\.[^.]+$/, '.json');
+    if (fs.existsSync(metaPath)) {
+      fs.unlinkSync(metaPath);
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Stream
+// Stream — local downloaded files
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.get('/api/stream/:filename', (req, res) => {
@@ -307,6 +879,190 @@ app.get('/api/stream/:filename', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Stream-YT — ad-free YouTube streaming via youtubei.js (InnerTube API)
+//
+// How it works (same approach as the ta3-android app's NewPipeExtractor):
+//   1. Use youtubei.js to call YouTube's internal InnerTube API and get stream info
+//   2. Properly decipher the n-token (the thing yt-dlp was failing to do reliably)
+//      using Node's vm module to evaluate YouTube's own player JS
+//   3. Proxy the deciphered CDN URL bytes to the client, forwarding Range headers
+//      so the <video> element can seek.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Lazy-initialised youtubei.js Innertube instance (ESM-only, so use dynamic import)
+let _ytClient = null;
+
+async function getYtClient() {
+  if (_ytClient) return _ytClient;
+
+  // youtubei.js is ESM-only; use dynamic import from CJS
+  const { Innertube, Platform } = await import('youtubei.js');
+  const { default: vm } = await import('node:vm');
+
+  // Patch the platform's JS evaluator to use Node's built-in vm module.
+  // This is required to decipher YouTube's n-token (anti-throttle parameter).
+  // The code generated by youtubei.js ends with a bare `return process(...)`,
+  // which is only valid inside a function — so we wrap it.
+  Platform.shim.eval = (data) => {
+    const code = data.output;
+    const wrapped = `(function() { ${code} })()`;
+    const ctx = vm.createContext({
+      globalThis: {}, window: {}, document: {}, console,
+      setTimeout, clearTimeout, URL, URLSearchParams,
+    });
+    ctx.globalThis = ctx; // __jsExtractorGlobal references globalThis
+    return new vm.Script(wrapped).runInContext(ctx);
+  };
+
+  _ytClient = await Innertube.create({ retrieve_player: true });
+  log('stream-yt', '[youtubei.js] Innertube client initialised');
+  return _ytClient;
+}
+
+/**
+ * Resolve the best video+audio stream URL for a YouTube video.
+ * Uses youtubei.js (InnerTube API) — same approach as NewPipeExtractor in the
+ * ta3-android app. Properly deciphers the n-token so CDN URLs don't 403.
+ *
+ * Format priority:
+ *   1. video+audio MP4 (H.264) — itag=18, progressive, single file, seekable ✓
+ *   2. video+audio best available (any container)
+ */
+async function resolveYtUrl(videoId) {
+  const yt = await getYtClient();
+  log('stream-yt', `[resolveYtUrl] Calling InnerTube for ${videoId}…`);
+
+  const info = await yt.getInfo(videoId);
+
+  // Try combined video+audio first (itag 18 = 360p H.264+AAC, most compatible)
+  let fmt = info.chooseFormat({ type: 'video+audio', quality: 'best', format: 'mp4' });
+  if (!fmt) {
+    // Fallback: any video+audio format
+    fmt = info.chooseFormat({ type: 'video+audio', quality: 'best' });
+  }
+  if (!fmt) throw new Error('No compatible stream format found');
+
+  log('stream-yt', `[resolveYtUrl] Selected format: itag=${fmt.itag} quality=${fmt.quality_label} mime=${fmt.mime_type}`);
+
+  const url = await fmt.decipher(yt.session.player);
+  if (!url || !url.startsWith('http')) throw new Error('decipher() returned invalid URL');
+
+  log('stream-yt', `[resolveYtUrl] Deciphered URL (first 100): ${url.slice(0, 100)}…`);
+  return url;
+}
+
+/**
+ * GET /api/stream-yt/:videoId
+ *
+ * Resolves the direct CDN stream URL via youtubei.js InnerTube API (n-token
+ * properly deciphered — no 403), then proxies bytes to the client.
+ * Forwards Range headers so the <video> player can seek.
+ */
+app.get('/api/stream-yt/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
+    return res.status(400).json({ error: 'Invalid videoId' });
+  }
+
+  log('stream-yt', `Resolving CDN URL for ${videoId}…`);
+
+  let streamUrl;
+  try {
+    streamUrl = await resolveYtUrl(videoId);
+  } catch (err) {
+    log('stream-yt', `[FAIL] URL resolve for ${videoId}: ${err.message}`);
+    return res.status(502).json({ error: 'Could not resolve stream URL', detail: err.message });
+  }
+
+  log('stream-yt', `[OK] Proxying stream for ${videoId}`);
+
+  // ── Proxy CDN bytes to the client ─────────────────────────────────────────
+  const forwardHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Encoding': 'identity',
+    'Referer': 'https://www.youtube.com/',
+    'Origin': 'https://www.youtube.com',
+    'Connection': 'keep-alive',
+  };
+  if (req.headers.range) {
+    forwardHeaders['Range'] = req.headers.range;
+    log('stream-yt', `Range: ${req.headers.range}`);
+  }
+
+  try {
+    const upRes = await fetch(streamUrl, {
+      method: 'GET',
+      headers: forwardHeaders,
+      redirect: 'follow',
+      // AbortController to cancel upstream fetch if client disconnects
+      signal: req.signal 
+    });
+
+    log('stream-yt', `CDN HTTP ${upRes.status} for ${videoId}`);
+
+    if (upRes.status === 403) {
+      log('stream-yt', `[403] CDN refused ${videoId} — URL may have expired; try again`);
+      if (!res.headersSent) res.status(502).json({ error: 'YouTube CDN returned 403 — please try again' });
+      return;
+    }
+
+    const pass = {};
+    for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']) {
+      const val = upRes.headers.get(h);
+      if (val) pass[h] = val;
+    }
+    pass['Access-Control-Allow-Origin'] = '*';
+
+    res.writeHead(upRes.status, pass);
+    
+    // Node.js 18+ can pipe Web Streams via stream.Readable.fromWeb
+    if (upRes.body) {
+      const { Readable } = require('stream');
+      Readable.fromWeb(upRes.body).pipe(res);
+    } else {
+      res.end();
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      log('stream-yt', `Client disconnected ${videoId}`);
+    } else {
+      log('stream-yt', `[ERROR] Connect failed for ${videoId}: ${e.message}`);
+      if (!res.headersSent) res.status(502).json({ error: 'Upstream request failed', detail: e.message });
+    }
+  }
+});
+
+/**
+ * GET /api/stream-yt/:videoId/info — debug endpoint: returns all available formats
+ */
+app.get('/api/stream-yt/:videoId/info', async (req, res) => {
+  const { videoId } = req.params;
+  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
+    return res.status(400).json({ error: 'Invalid videoId' });
+  }
+  log('stream-yt', `[INFO] Format list for ${videoId}`);
+  try {
+    const yt = await getYtClient();
+    const info = await yt.getInfo(videoId);
+    const formats = info.streaming_data?.formats?.map(f => ({
+      itag: f.itag, mime: f.mime_type, quality: f.quality_label,
+      bitrate: f.bitrate, fps: f.fps, width: f.width, height: f.height,
+    })) || [];
+    const adaptive = info.streaming_data?.adaptive_formats?.map(f => ({
+      itag: f.itag, mime: f.mime_type, quality: f.quality_label,
+      bitrate: f.bitrate, fps: f.fps, width: f.width, height: f.height,
+    })) || [];
+    res.json({ videoId, formats, adaptive_formats: adaptive });
+  } catch (err) {
+    log('stream-yt', `[INFO FAIL] ${videoId}: ${err.message}`);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -318,27 +1074,76 @@ function ytdlpJson(args) {
     proc.stderr.on('data', d => { err += d; });
     proc.on('close', (code) => {
       if (code !== 0) return reject(new Error((err || '').slice(0, 300) || `yt-dlp exit ${code}`));
-      const videos = out.trim().split('\n').filter(Boolean).map(line => {
+      
+      let parsedObjects = [];
+      const lines = out.trim().split('\n').filter(Boolean);
+      for (const line of lines) {
         try {
-          const v = JSON.parse(line);
-          const thumb = (v.thumbnails && v.thumbnails.at(-1)?.url) || v.thumbnail
-            || `https://img.youtube.com/vi/${v.id}/mqdefault.jpg`;
-          return {
-            id:          v.id,
-            title:       v.title || v.fulltitle || v.id,
-            thumbnail:   thumb,
-            duration:    v.duration    || 0,
-            durationStr: formatDuration(v.duration),
-            channel:     v.channel     || v.uploader || '',
-            viewCount:   v.view_count  || 0,
-            uploadDate:  v.upload_date || '',
-          };
-        } catch { return null; }
+          const obj = JSON.parse(line);
+          if (obj._type === 'playlist' && Array.isArray(obj.entries)) {
+            parsedObjects.push(...obj.entries);
+          } else {
+            parsedObjects.push(obj);
+          }
+        } catch { /* ignore */ }
+      }
+
+      const videos = parsedObjects.map(v => {
+        if (!v || !v.id) return null;
+        const thumb = (v.thumbnails && v.thumbnails.at(-1)?.url) || v.thumbnail
+          || `https://img.youtube.com/vi/${v.id}/mqdefault.jpg`;
+        return {
+          id:          v.id,
+          title:       v.title || v.fulltitle || v.id,
+          thumbnail:   thumb,
+          duration:    v.duration    || 0,
+          durationStr: formatDuration(v.duration),
+          channel:     v.channel     || v.uploader || '',
+          viewCount:   v.view_count  || 0,
+          uploadDate:  v.upload_date || '',
+        };
       }).filter(Boolean);
       resolve(videos);
     });
     proc.on('error', reject);
   });
+}
+
+/**
+ * Parse a Netscape cookies.txt file and return a cookie string for YouTube/Google.
+ * Exported as a named function so it can be unit-tested independently.
+ *
+ * @param {string} filePath - Absolute path to the cookies.txt file
+ * @returns {string} Cookie header string, e.g. "SID=abc; HSID=xyz"
+ */
+function parseCookiesFromFile(filePath) {
+  if (!fs.existsSync(filePath)) return '';
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+  return lines
+    .filter(l => !l.startsWith('#') && l.trim() && l.split('\t').length >= 7)
+    .filter(l => {
+      const domain = l.split('\t')[0];
+      return domain.includes('youtube.com') || domain.includes('google.com');
+    })
+    .map(l => { const parts = l.split('\t'); return parts[5] + '=' + parts[6].trim(); })
+    .join('; ');
+}
+
+/**
+ * Shared youtubei.js client initialization using the exported cookies file.
+ */
+async function getYoutubeiClient() {
+  const cookies = parseCookiesFromFile(COOKIES_FILE);
+  if (!cookies) return null;
+
+  const { Innertube, Platform } = await import('youtubei.js');
+  const { default: vm } = await import('node:vm');
+  Platform.shim.eval = (data) => {
+    const ctx = vm.createContext({ globalThis: {}, window: {}, document: {}, console, setTimeout, clearTimeout, URL, URLSearchParams });
+    ctx.globalThis = ctx;
+    return new vm.Script(`(function() { ${data.output} })()`).runInContext(ctx);
+  };
+  return await Innertube.create({ retrieve_player: true, cookie: cookies });
 }
 
 function formatDuration(secs) {
@@ -353,6 +1158,7 @@ app.listen(PORT, () => {
   console.log(`🚀  Server →  http://localhost:${PORT}`);
   console.log(`📁  Downloads: ${DOWNLOAD_DIR}`);
   console.log(`🌐  Browser:   ${BROWSER}`);
+  console.log(`⚡  Cache:     ${CACHE_PAGES} pages × ${['home', ...CHIP_TOPICS].length} topics, refresh every ${CACHE_REFRESH_MS / 60000}min`);
   console.log('');
   console.log('Open the app → http://localhost:' + PORT);
 });

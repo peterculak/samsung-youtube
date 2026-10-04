@@ -54,6 +54,12 @@
   <nav id="sidebar" class="sidebar">
     <div class="sidebar-logo">▶ YTD</div>
 
+    <!-- User profile (shown once authenticated) -->
+    <div id="sidebar-user-btn" style="display:none; align-items:center; gap:12px; padding:0 24px 28px; cursor:default;">
+      <img id="sidebar-user-avatar" src="" alt="avatar" style="width:36px; height:36px; border-radius:50%; object-fit:cover; display:none; background:#333; box-shadow:0 0 10px rgba(0,0,0,0.5);" />
+      <span id="sidebar-user-name" style="font-size:16px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text);"></span>
+    </div>
+
     <div class="nav-items">
       <div class="nav-item" id="nav-home"      data-focuszone="sidebar" data-focusidx="0" data-target="home">
         <span class="nav-icon">⊞</span><span>Home</span>
@@ -67,9 +73,12 @@
       <div class="nav-item" id="nav-downloads" data-focuszone="sidebar" data-focusidx="3" data-target="downloads">
         <span class="nav-icon">⬇</span><span>Downloads</span>
       </div>
+      <div class="nav-item" id="nav-logs"      data-focuszone="sidebar" data-focusidx="4" data-target="logs">
+        <span class="nav-icon">⌨</span><span>Logs</span>
+      </div>
     </div>
 
-    <div class="nav-item nav-signout" data-focuszone="sidebar" data-focusidx="4" data-action="signout">
+    <div class="nav-item nav-signout" data-focuszone="sidebar" data-focusidx="5" data-action="signout">
       <span class="nav-icon">⎋</span><span>Sign Out</span>
     </div>
   </nav>
@@ -83,6 +92,24 @@
         <h2 id="home-title">Home</h2>
         <button class="btn-icon" id="btn-refresh-home" data-focuszone="home-header" data-focusidx="0">↻ Refresh</button>
       </div>
+      
+      <div class="chips-wrapper" style="overflow-x: auto; white-space: nowrap; margin-bottom: 20px; padding-bottom: 10px; scrollbar-width: none;">
+        <div id="home-chips" class="chips-container" style="display: inline-flex; gap: 10px;">
+          <button class="chip active" data-topic="All" data-focuszone="chips" data-focusidx="0" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">All</button>
+          <button class="chip" data-topic="Music" data-focuszone="chips" data-focusidx="1" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Music</button>
+          <button class="chip" data-topic="Gaming" data-focuszone="chips" data-focusidx="2" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Gaming</button>
+          <button class="chip" data-topic="News" data-focuszone="chips" data-focusidx="3" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">News</button>
+          <button class="chip" data-topic="Comedy" data-focuszone="chips" data-focusidx="4" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Comedy</button>
+          <button class="chip" data-topic="Podcasts" data-focuszone="chips" data-focusidx="5" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Podcasts</button>
+          <button class="chip" data-topic="Programming" data-focuszone="chips" data-focusidx="6" style="padding: 8px 16px; border-radius: 8px; background: var(--bg-3); color: var(--text); border: none; font-size: 1rem; cursor: pointer; transition: background 0.2s;">Programming</button>
+        </div>
+      </div>
+      <style>
+        .chips-wrapper::-webkit-scrollbar { display: none; }
+        .chip.focused, .chip:focus { outline: 3px solid var(--text); outline-offset: 2px; }
+        .chip.active { background: var(--text) !important; color: var(--bg) !important; font-weight: bold; }
+      </style>
+
       <div id="grid-home" class="video-grid"></div>
     </section>
 
@@ -119,6 +146,16 @@
       <div id="jobs-list" class="jobs-list"></div>
     </section>
 
+    <!-- Logs Section -->
+    <section id="section-logs" class="content-section hidden">
+      <div class="section-header">
+        <h2>Server Logs</h2>
+        <button class="btn-icon" id="btn-refresh-logs" data-focuszone="logs-header" data-focusidx="0">↻ Refresh</button>
+        <button class="btn-icon" id="btn-clear-logs"   data-focuszone="logs-header" data-focusidx="1">✕ Clear</button>
+      </div>
+      <div id="logs-list" class="logs-list"></div>
+    </section>
+
   </main>
 </div>
 
@@ -133,9 +170,11 @@
       <p  id="modal-duration" class="modal-meta"></p>
     </div>
     <div class="modal-actions">
-      <button id="modal-btn-download" class="btn btn-primary"   data-focuszone="modal" data-focusidx="0">⬇ Download</button>
-      <button id="modal-btn-play"     class="btn btn-success hidden" data-focuszone="modal" data-focusidx="1">▶ Play</button>
-      <button id="modal-btn-close"    class="btn btn-outline"   data-focuszone="modal" data-focusidx="2">✕ Close</button>
+      <button id="modal-btn-stream"   class="btn btn-stream hidden"    data-focuszone="modal" data-focusidx="0">▶ Stream</button>
+      <button id="modal-btn-download" class="btn btn-primary"   data-focuszone="modal" data-focusidx="1">⬇ Download</button>
+      <button id="modal-btn-play"     class="btn btn-success hidden" data-focuszone="modal" data-focusidx="2">▶ Play</button>
+      <button id="modal-btn-delete"   class="btn btn-danger hidden"  data-focuszone="modal" data-focusidx="3">🗑 Delete</button>
+      <button id="modal-btn-close"    class="btn btn-outline"   data-focuszone="modal" data-focusidx="4">✕ Close</button>
     </div>
   </div>
 </div>
